@@ -2,9 +2,9 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn, Tensor, tensor
 from torch.nn import Module, Parameter
-import torch.nn.functional as F
 from torch.func import grad, vmap, functional_call
 
 import einx
@@ -94,7 +94,9 @@ class MemoryKeyValueBind(Module):
 
         delta_fast_weights = self.store(memory_params, (k, v))
 
-        delta_fast_weights = {name: delta * self.learnable_lr for name, delta in delta_fast_weights.items()}
+        lr = F.softplus(self.learnable_lr)
+
+        delta_fast_weights = {name: delta * lr for name, delta in delta_fast_weights.items()}
 
         # retrieve with queries
 
