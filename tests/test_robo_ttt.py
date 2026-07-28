@@ -17,7 +17,7 @@ def test_memory_key_value_bind(
     muon_update,
     muon_param_names
 ):
-    from robo_ttt.robo_ttt import MemoryKeyValueBind, TTTWrapper
+    from robo_ttt.robo_ttt import MemoryKeyValueBind, TTTWrapper, Attention
 
     dim = 16
     memory_network = nn.Sequential(
@@ -46,7 +46,7 @@ def test_memory_key_value_bind(
 
     # ttt wrapper
 
-    block = nn.Linear(dim, dim)
+    block = Attention(dim)
     wrapper = TTTWrapper(dim, memory = memory, block = block)
 
     output1, next_fast_weights1, _ = wrapper(tokens)

@@ -1,15 +1,16 @@
 from __future__ import annotations
+from functools import partial
 from collections import namedtuple
 from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor, tensor
-from torch.nn import Module, Parameter
+from torch.nn import Module, Parameter, Linear
 from torch.func import grad, vmap, functional_call
 
 import einx
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import pack_with_inverse, tree_flatten_with_inverse, tree_map_detach
@@ -17,6 +18,8 @@ from torch_einops_utils import pack_with_inverse, tree_flatten_with_inverse, tre
 # constants
 
 Params = dict[str, Tensor]
+
+LinearNoBias = partial(Linear, bias = False)
 
 # helpers
 
@@ -242,6 +245,58 @@ class TTTWrapper(Module):
         out = unflatten_tree((out, *rest))
 
         return out, next_fast_weights, intermediates
+
+# attention
+
+class Attention(Module):
+    def __init__(
+        self,
+        dim,
+        dim_context = None,
+        dim_head = 64,
+        heads = 8,
+        pre_rmsnorm = True
+    ):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        dim_context = default(dim_context, dim)
+        dim_inner = dim_head * heads
+
+        self.norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
+
+        self.to_q = LinearNoBias(dim, dim_inner)
+        self.to_kv = LinearNoBias(dim, dim_inner * 2)
+
+        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+
+        self.merge_heads = Rearrange('b h n d -> b n (h d)')
+
+        self.to_out = LinearNoBias(dim_inner, dim)
+
+    def forward(
+        self,
+        tokens,
+        context = None,
+        mask = None
+    ):
+        tokens = self.norm(tokens)
+
+        context = default(context, tokens)
+
+        q = self.to_q(tokens)
+        kv = self.to_kv(context).chunk(2, dim = -1)
+
+        q, k, v = map(self.split_heads, (q, *kv))
+
+        sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
+        sim = sim * self.scale
+
+        attn = sim.softmax(dim = -1)
+
+        agg = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+        out = self.merge_heads(agg)
+        return self.to_out(out)
 
 # classes
 
