@@ -33,7 +33,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://pypi.org/project/robo-ttt/"
-Repository = "https://codeberg.org/lucidrains/RoboTTT"
+Repository = "https://codeberg.org/lucidrains/robo_ttt"
 
 [project.optional-dependencies]
 examples = []
