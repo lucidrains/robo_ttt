@@ -3,37 +3,54 @@ import pytest
 import torch
 from torch import nn
 
+param = pytest.mark.parametrize
+
 def test_robo_ttt():
     from robo_ttt.robo_ttt import RoboTTT
 
     model = RoboTTT()
     assert True
 
-def test_memory_key_value_bind():
+@param('muon_update', [False, True])
+@param('muon_param_names', [None, ('0.weight',)])
+def test_memory_key_value_bind(
+    muon_update,
+    muon_param_names
+):
     from robo_ttt.robo_ttt import MemoryKeyValueBind, TTTWrapper
 
     dim = 16
-    net = nn.Sequential(nn.Linear(dim, 32), nn.GELU(), nn.Linear(32, dim))
-    mem = MemoryKeyValueBind(dim, net)
+    memory_network = nn.Sequential(
+        nn.Linear(dim, 32),
+        nn.GELU(),
+        nn.Linear(32, dim)
+    )
+
+    memory = MemoryKeyValueBind(
+        dim,
+        memory_network,
+        muon_update = muon_update,
+        muon_param_names = muon_param_names
+    )
 
     tokens = torch.randn(2, 4, dim)
 
     # memory standalone
 
-    out1, next_fast_weights1 = mem(tokens)
-    assert out1.shape == (2, 4, dim)
-    assert set(next_fast_weights1.keys()) == set(net.state_dict().keys())
+    output1, next_fast_weights1 = memory(tokens)
+    assert output1.shape == (2, 4, dim)
+    assert set(next_fast_weights1.keys()) == set(memory_network.state_dict().keys())
 
-    out2, next_fast_weights2 = mem(tokens, next_fast_weights1)
-    assert out2.shape == (2, 4, dim)
+    output2, next_fast_weights2 = memory(tokens, prev_fast_weights = next_fast_weights1)
+    assert output2.shape == (2, 4, dim)
 
     # ttt wrapper
 
     block = nn.Linear(dim, dim)
-    wrapper = TTTWrapper(dim, memory = mem, block = block)
+    wrapper = TTTWrapper(dim, memory = memory, block = block)
 
-    out1, next_fw1, _ = wrapper(tokens)
-    assert out1.shape == (2, 4, dim)
+    output1, next_fast_weights1, _ = wrapper(tokens)
+    assert output1.shape == (2, 4, dim)
 
-    out2, next_fw2, _ = wrapper(tokens, prev_fast_weights = next_fw1)
-    assert out2.shape == (2, 4, dim)
+    output2, next_fast_weights2, _ = wrapper(tokens, prev_fast_weights = next_fast_weights1)
+    assert output2.shape == (2, 4, dim)

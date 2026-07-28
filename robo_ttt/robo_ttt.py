@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections import namedtuple
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -31,13 +32,50 @@ def add_dict(x, y):
 
     return {k: x[k] + y[k] for k in x.keys()}
 
+def transpose(t):
+    return t.transpose(-1, -2)
+
+# muon updates
+
+def newtonschulz5(
+    t,
+    steps = 5,
+    eps = 1e-7,
+    coefs = (3.4445, -4.7750, 2.0315)
+):
+    assert t.ndim > 2
+
+    t, inv_pack = pack_with_inverse(t, '* i j')
+
+    m, n = t.shape[-2:]
+    should_transpose = m > n
+
+    if should_transpose:
+        t = transpose(t)
+
+    t = t / t.norm(dim = (-1, -2), keepdim = True).clamp(min = eps)
+
+    a, b, c = coefs
+
+    for _ in range(steps):
+        A = t @ transpose(t)
+        B = b * A + c * A @ A
+        t = a * t + B @ t
+
+    if should_transpose:
+        t = transpose(t)
+
+    return inv_pack(t)
+
 # ttt memory
 
 class MemoryKeyValueBind(Module):
     def __init__(
         self,
         dim,
-        memory_net: Module
+        memory_net: Module,
+        muon_update = False,
+        muon_param_names: Sequence[str] | None = None
     ):
         super().__init__()
 
@@ -69,14 +107,28 @@ class MemoryKeyValueBind(Module):
 
         # learning rate
 
-        self.learnable_lr = Parameter(tensor(1e-1))
+        self.learnable_lr = Parameter(tensor(1e-2))
+
+        # maybe muon update
+
+        self.muon_update = muon_update
+        self.muon_param_names = set()
+
+        if muon_update:
+            self.muon_learnable_lr = Parameter(tensor(1e-1))
+
+            self.muon_param_names = set(
+                param_name for param_name, param in self.base_memory_params.items()
+                if param.ndim >= 2 and (not exists(muon_param_names) or param_name in muon_param_names)
+            )
 
     def forward(
         self,
         tokens: Tensor,
         prev_fast_weights: Params | None = None
     ) -> tuple[Tensor, Params]:
-        batch = tokens.shape[0]
+
+        batch, muon_update = tokens.shape[0], self.muon_update
 
         # get the queries for retrieving, and keys and values for storing
 
@@ -94,13 +146,31 @@ class MemoryKeyValueBind(Module):
 
         delta_fast_weights = self.store(memory_params, (k, v))
 
+        # updates, standard gd or muon update
+
         lr = F.softplus(self.learnable_lr)
 
-        delta_fast_weights = {name: delta * lr for name, delta in delta_fast_weights.items()}
+        if muon_update:
+            muon_lr = F.softplus(self.muon_learnable_lr)
 
-        # retrieve with queries
+        updated_delta_fast_weights = {}
 
-        retrieved = self.retrieve(memory_params, q)
+        for name, delta_weights in delta_fast_weights.items():
+
+            if muon_update and name in self.muon_param_names:
+                delta_weights = newtonschulz5(delta_weights) * muon_lr
+            else:
+                delta_weights = delta_weights * lr
+
+            updated_delta_fast_weights[name] = delta_weights
+
+        delta_fast_weights = updated_delta_fast_weights
+
+        # retrieve with queries - section 2 eq (1) & (2) update then apply
+
+        next_memory_params = add_dict(delta_fast_weights, memory_params)
+
+        retrieved = self.retrieve(next_memory_params, q)
 
         return retrieved, delta_fast_weights
 
