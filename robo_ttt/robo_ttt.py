@@ -2,14 +2,20 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import nn
-from torch.nn import Module
+from torch import nn, Tensor, tensor
+from torch.nn import Module, Parameter
+import torch.nn.functional as F
+from torch.func import grad, vmap, functional_call
 
 import einx
-from einops import rearrange
+from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import pack_with_inverse, tree_flatten_with_inverse, tree_map_detach
+
+# constants
+
+Params = dict[str, Tensor]
 
 # helpers
 
@@ -24,6 +30,77 @@ def add_dict(x, y):
         return y
 
     return {k: x[k] + y[k] for k in x.keys()}
+
+# ttt memory
+
+class MemoryKeyValueBind(Module):
+    def __init__(
+        self,
+        dim,
+        memory_net: Module
+    ):
+        super().__init__()
+
+        # query key values
+
+        self.to_qkv = nn.Sequential(
+            nn.RMSNorm(dim),
+            nn.Linear(dim, dim * 3)
+        )
+
+        self.split_qkv = Rearrange('b n (qkv d) -> qkv b n d', qkv = 3)
+
+        # the memory
+
+        self.memory = memory_net
+        self.base_memory_params = dict(memory_net.named_parameters())
+
+        def _retrieve(params, inputs):
+            return functional_call(memory_net, params, (inputs,))
+
+        self.retrieve = vmap(_retrieve, in_dims = (0, 0))
+
+        def _store(params, inputs):
+            keys, values = inputs
+            retrieved = _retrieve(params, keys)
+            return -F.mse_loss(retrieved, values)
+
+        self.store = vmap(grad(_store, argnums = 0), in_dims = (0, 0))
+
+        # learning rate
+
+        self.learnable_lr = Parameter(tensor(1e-1))
+
+    def forward(
+        self,
+        tokens: Tensor,
+        prev_fast_weights: Params | None = None
+    ) -> tuple[Tensor, Params]:
+        batch = tokens.shape[0]
+
+        # get the queries for retrieving, and keys and values for storing
+
+        qkv = self.to_qkv(tokens)
+
+        q, k, v = self.split_qkv(qkv)
+
+        # constitute the params from accumulated fast weights and base params
+
+        base_memory_params = {param_name: repeat(param, '... -> b ...', b = batch) for param_name, param in self.base_memory_params.items()}
+
+        memory_params = add_dict(prev_fast_weights, base_memory_params)
+
+        # get the next generated fast weights from the surprise
+
+        delta_fast_weights = self.store(memory_params, (k, v))
+
+        delta_fast_weights = {name: delta * self.learnable_lr for name, delta in delta_fast_weights.items()}
+
+        # retrieve with queries
+
+        retrieved = self.retrieve(memory_params, q)
+
+        return retrieved, delta_fast_weights
 
 # ttt wrapper
 
@@ -48,7 +125,7 @@ class TTTWrapper(Module):
         self,
         tokens,
         *args,
-        prev_fast_weights = None,
+        prev_fast_weights: Params | None = None,
         detach_prev_fast_weights = False,
         detach_next_fast_weights = False,
         **kwargs
