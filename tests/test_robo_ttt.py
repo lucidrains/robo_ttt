@@ -13,9 +13,11 @@ def test_robo_ttt():
 
 @param('muon_update', [False, True])
 @param('muon_param_names', [None, ('0.weight',)])
+@param('learned_forget', [False, True])
 def test_memory_key_value_bind(
     muon_update,
-    muon_param_names
+    muon_param_names,
+    learned_forget
 ):
     from robo_ttt.robo_ttt import MemoryKeyValueBind, TTTWrapper, Attention
 
@@ -30,7 +32,8 @@ def test_memory_key_value_bind(
         dim,
         memory_network,
         muon_update = muon_update,
-        muon_param_names = muon_param_names
+        muon_param_names = muon_param_names,
+        learned_forget = learned_forget
     )
 
     tokens = torch.randn(2, 4, dim)

@@ -9,9 +9,9 @@ from torch import nn, Tensor, tensor
 from torch.nn import Module, Parameter, Linear
 from torch.func import grad, vmap, functional_call
 
-import einx
+from einx import multiply
 from einops import rearrange, repeat, einsum
-from einops.layers.torch import Rearrange
+from einops.layers.torch import Rearrange, Reduce
 
 from torch_einops_utils import pack_with_inverse, tree_flatten_with_inverse, tree_map_detach
 
@@ -78,7 +78,8 @@ class MemoryKeyValueBind(Module):
         dim,
         memory_net: Module,
         muon_update = False,
-        muon_param_names: Sequence[str] | None = None
+        muon_param_names: Sequence[str] | None = None,
+        learned_forget = False
     ):
         super().__init__()
 
@@ -125,13 +126,28 @@ class MemoryKeyValueBind(Module):
                 if param.ndim >= 2 and (not exists(muon_param_names) or param_name in muon_param_names)
             )
 
+        # forget gates
+
+        self.learned_forget = learned_forget
+
+        if learned_forget:
+            self.to_forget_gate = nn.Sequential(
+                Reduce('b n d -> b d', 'mean'),
+                nn.RMSNorm(dim),
+                nn.Linear(dim, dim * 2),
+                nn.SiLU(),
+                nn.Linear(dim * 2, 1),
+                nn.Sigmoid(),
+                Rearrange('b 1 -> b')
+            )
+
     def forward(
         self,
         tokens: Tensor,
         prev_fast_weights: Params | None = None
     ) -> tuple[Tensor, Params]:
 
-        batch, muon_update = tokens.shape[0], self.muon_update
+        batch, muon_update, should_forget = tokens.shape[0], self.muon_update, self.learned_forget
 
         # get the queries for retrieving, and keys and values for storing
 
@@ -149,16 +165,22 @@ class MemoryKeyValueBind(Module):
 
         delta_fast_weights = self.store(memory_params, (k, v))
 
-        # updates, standard gd or muon update
+        # updates, standard gd or muon update, and optional learned forget gates (many papers show forgetting / wd is important)
 
         lr = F.softplus(self.learnable_lr)
 
         if muon_update:
             muon_lr = F.softplus(self.muon_learnable_lr)
 
+        if should_forget:
+            forget_gate = self.to_forget_gate(tokens)
+
         updated_delta_fast_weights = {}
 
         for name, delta_weights in delta_fast_weights.items():
+
+            if should_forget:
+                delta_weights = multiply('b ..., b -> b ...', delta_weights, forget_gate)
 
             if muon_update and name in self.muon_param_names:
                 delta_weights = newtonschulz5(delta_weights) * muon_lr
