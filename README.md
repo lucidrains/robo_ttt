@@ -1,3 +1,5 @@
+<img src="./fig2.png" width="400"></img>
+
 ## RoboTTT (wip)
 
 Implementation of [RoboTTT](https://research.nvidia.com/labs/gear/robottt/) proposed by Yunfan Jiang et al. of Stanford and Nvidia
