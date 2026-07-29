@@ -1,6 +1,6 @@
 [project]
 name = "robo-ttt"
-version = "0.0.6"
+version = "0.0.7"
 description = "RoboTTT - Context Scaling for Robot Policies"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -26,9 +26,9 @@ classifiers=[
 
 dependencies = [
     "einx>=0.3.0",
-    "einops>=0.8.0",
+    "einops>=0.8.1",
     "torch>=2.5",
-    "torch-einops-utils>=0.1.11"
+    "torch-einops-utils>=0.1.12"
 ]
 
 [project.urls]
@@ -38,7 +38,9 @@ Repository = "https://codeberg.org/lucidrains/robo_ttt"
 [project.optional-dependencies]
 examples = []
 test = [
-    "pytest"
+    "pytest",
+    "mimic-video>=0.3.11",
+    "pi-zero-pytorch>=0.5.11"
 ]
 
 [tool.pytest.ini_options]

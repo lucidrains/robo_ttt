@@ -1,27 +1,32 @@
 from __future__ import annotations
+from copy import deepcopy
 from functools import partial
 from collections import namedtuple
-from collections.abc import Sequence
+from collections.abc import Sequence, Callable
 
 import torch
 import torch.nn.functional as F
-from torch import nn, Tensor, tensor, stack
-from torch.nn import Module, Parameter, Linear
+from torch import nn, Tensor, tensor, is_tensor
+from torch.distributions import Beta
+from torch.nn import Module, ModuleList, Parameter
 from torch.func import grad, vmap, functional_call
 
 from einx import multiply
-from einops import rearrange, repeat, einsum
+from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange, Reduce
 
-from torch_einops_utils import pack_with_inverse, tree_map_detach
+from torch_einops_utils import pack_with_inverse, tree_map_detach, tree_map_tensor, tree_flatten_with_inverse, masked_mean
+from torch_einops_utils.device import module_device
 
 # constants
 
 Params = dict[str, Tensor]
-
-LinearNoBias = partial(Linear, bias = False)
+ArgKey = int | str
+ArgKeys = Sequence[ArgKey]
+ModulePaths = Sequence[str] | str
 
 # helpers
+
 
 def exists(t):
     return t is not None
@@ -31,6 +36,34 @@ def default(t, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+def cast_tuple(val, length = 1):
+    if isinstance(val, tuple):
+        return val
+    if isinstance(val, list):
+        return tuple(val)
+    return (val,) * length
+
+# args utils
+
+def get_arg(args: tuple, kwargs: dict, arg_key: ArgKey):
+    return args[arg_key] if isinstance(arg_key, int) else kwargs[arg_key]
+
+def set_arg(args: tuple, kwargs: dict, arg_key: ArgKey, val):
+    if isinstance(arg_key, int):
+        return (*args[:arg_key], val, *args[arg_key + 1:]), kwargs
+    return args, {**kwargs, arg_key: val}
+
+def has_arg(args: tuple, kwargs: dict, arg_key: ArgKey):
+    if not exists(arg_key):
+        return False
+
+    if isinstance(arg_key, int):
+        return arg_key < len(args)
+
+    return arg_key in kwargs
+
+# tensor helpers
 
 def add_dict(x, y):
     if not exists(x):
@@ -271,15 +304,277 @@ class TTTWrapper(Module):
 
         return out, next_fast_weights, intermediates
 
-# classes
+# sample action times using beta distribution following Kevin Black et al. (https://arxiv.org/abs/2410.24164)
+# 0 noise -> 1 data
+
+def sample_action_times(
+    batch_times: int,
+    *,
+    s = 0.999,
+    beta_a = 1.5,
+    beta_b = 1.0
+):
+    u = Beta(beta_a, beta_b).sample((batch_times,))
+    return s * (1. - u)
+
+# main robo-ttt class
 
 class RoboTTT(Module):
     def __init__(
         self,
-        vla: Module,
+        model: Module,
         *,
         ttt_wrapper: TTTWrapper,
+        ttt_module_paths: ModulePaths = (),
+        batch_time_arg = 0,
+        expand_time_args: ArgKeys = (),
+        omit_time_args: ArgKeys = (),
+        times_arg: ArgKey | None = 'time',
+        unreduced_loss_arg: ArgKey | None = 'return_unreduced_loss',
+        loss_arg: ArgKey = 0,
+        sample_action_times_fn: Callable | None = None
     ):
         super().__init__()
-        self.vla = vla
+        self.model = model
         self.ttt_wrapper = ttt_wrapper
+
+        # arg keys
+
+        self.batch_time_arg = batch_time_arg
+        self.expand_time_args = set(expand_time_args)
+        self.omit_time_args = set(omit_time_args)
+        self.times_arg = times_arg
+        self.unreduced_loss_arg = unreduced_loss_arg
+        self.loss_arg = loss_arg
+        self.sample_action_times_fn = sample_action_times_fn
+
+        # ttt wrappers for designated submodules
+
+        self.ttt_module_paths = cast_tuple(ttt_module_paths)
+        self.ttt_wrappers = ModuleList([deepcopy(ttt_wrapper) for _ in self.ttt_module_paths])
+        self.submodules = [model.get_submodule(path) for path in self.ttt_module_paths]
+
+        # default prev fast weights
+
+        self.default_prev_fast_weights = (None,) * len(self.ttt_wrappers)
+
+    @property
+    def device(self):
+        return module_device(self)
+
+    def _normalize_prev_fast_weights(self, prev_fast_weights):
+        prev_fast_weights = cast_tuple(default(prev_fast_weights, self.default_prev_fast_weights))
+        assert len(prev_fast_weights) == len(self.ttt_wrappers)
+        return prev_fast_weights
+
+    def _forward_with_ttt(self, fn: Callable, args: tuple, kwargs: dict, time: int, prev_fast_weights):
+        handles = []
+        layer_fast_weights = list(prev_fast_weights)
+
+        # helpers for packing and unpacking time into batch dimension
+
+        pack_batch_time = partial(rearrange, pattern = 'b t ... -> (b t) ...')
+        unpack_batch_time = partial(rearrange, pattern = '(b t) ... -> b t ...', t = time)
+
+        # register forward hooks
+
+        for idx, (submodule, ttt_wrapper) in enumerate(zip(self.submodules, self.ttt_wrappers)):
+            def hook(module, input, output, ttt_wrapper = ttt_wrapper, idx = idx):
+                assert output.ndim == 3, f'module output must be 3d tensor of shape (batch * time, action_chunk_len, dim), but got shape {output.shape} for module "{module.__class__.__name__}"'
+
+                prev_fast_weight = layer_fast_weights[idx]
+
+                # ttt memory forward
+
+                action_chunks = unpack_batch_time(output)
+                ttt_memory_out, next_fast_weight, _ = ttt_wrapper(action_chunks, prev_fast_weights = prev_fast_weight)
+                layer_fast_weights[idx] = next_fast_weight
+
+                # add to output
+
+                return output + pack_batch_time(ttt_memory_out)
+
+            handles.append(submodule.register_forward_hook(hook))
+
+        # forward model
+
+        out = fn(*args, **kwargs)
+
+        # unregister hooks
+
+        for handle in handles:
+            handle.remove()
+
+        return out, tuple(layer_fast_weights)
+
+    def _get_batch_time(
+        self,
+        args: tuple,
+        kwargs: dict
+    ):
+        target = get_arg(args, kwargs, self.batch_time_arg)
+        assert is_tensor(target) and target.ndim >= 2, f'batch_time_arg target must be a tensor of at least 2 dimensions'
+        batch, time = target.shape[:2]
+
+        pack_batch_time = partial(rearrange, pattern = 'b t ... -> (b t) ...')
+
+        def unpack_batch_time(t):
+            if not is_tensor(t) or t.ndim == 0:
+                return t
+
+            batch_times, *_ = t.shape
+
+            if batch_times != batch * time:
+                return t
+
+            return rearrange(t, '(b t) ... -> b t ...', t = time)
+
+        return batch, time, pack_batch_time, unpack_batch_time
+
+    def _forward_with_time_packing(
+        self,
+        fn: Callable,
+        args: tuple,
+        kwargs: dict,
+        *,
+        prev_fast_weights = None,
+        auto_unsqueeze_time: bool = False,
+        before_forward_fn: Callable | None = None
+    ):
+        # auto unsqueeze time dimension 1 for single-timestep sampling inputs if flag is set
+
+        if auto_unsqueeze_time:
+            non_temporal_keys = self.omit_time_args | self.expand_time_args
+            unsqueeze_time = lambda t: rearrange(t, 'b ... -> b 1 ...')
+
+            args = tuple(arg if idx in non_temporal_keys else tree_map_tensor(unsqueeze_time, arg) for idx, arg in enumerate(args))
+            kwargs = {k: (v if k in non_temporal_keys else tree_map_tensor(unsqueeze_time, v)) for k, v in kwargs.items()}
+
+        # normalize fast weights
+
+        prev_fast_weights = self._normalize_prev_fast_weights(prev_fast_weights)
+
+        # batch time
+
+        batch, time, pack_batch_time, unpack_batch_time = self._get_batch_time(args, kwargs)
+
+        # expand non-temporal args across time if needed
+
+        for arg_key in self.expand_time_args:
+            val = tree_map_tensor(lambda t: repeat(t, 'b ... -> (b t) ...', t = time), get_arg(args, kwargs, arg_key))
+            args, kwargs = set_arg(args, kwargs, arg_key, val)
+
+        # omit non-temporal args from time-packing
+
+        omitted = {arg_key: get_arg(args, kwargs, arg_key) for arg_key in self.omit_time_args if has_arg(args, kwargs, arg_key)}
+
+        # pack time into batch dimension
+
+        packed_args, packed_kwargs = tree_map_tensor(pack_batch_time, (args, kwargs))
+
+        for arg_key, val in omitted.items():
+            packed_args, packed_kwargs = set_arg(packed_args, packed_kwargs, arg_key, val)
+
+        if exists(before_forward_fn):
+            packed_args, packed_kwargs = before_forward_fn(batch, time, args, kwargs, packed_args, packed_kwargs)
+
+        # forward model with ttt hooks
+
+        out, next_fast_weights = self._forward_with_ttt(fn, packed_args, packed_kwargs, time, prev_fast_weights)
+
+        # unpack time
+
+        out = tree_map_tensor(unpack_batch_time, out)
+
+        if auto_unsqueeze_time:
+            out = tree_map_tensor(lambda t: rearrange(t, 'b 1 ... -> b ...'), out)
+
+        return out, next_fast_weights
+
+    def sample(
+        self,
+        *args,
+        sample_fn_name: str | None = None,
+        prev_fast_weights: Sequence[Params | None] | Params | None = None,
+        return_fast_weights: bool | None = None,
+        auto_unsqueeze_time: bool = True,
+        **kwargs
+    ):
+        return_fast_weights = default(return_fast_weights, exists(prev_fast_weights))
+
+        # resolve sample fn
+
+        sample_fn_name = default(sample_fn_name, 'sample' if hasattr(self.model, 'sample') else ('sample_actions' if hasattr(self.model, 'sample_actions') else '__call__'))
+        sample_fn = getattr(self.model, sample_fn_name) if sample_fn_name != '__call__' else self.model
+
+        out, next_fast_weights = self._forward_with_time_packing(
+            sample_fn,
+            args,
+            kwargs,
+            prev_fast_weights = prev_fast_weights,
+            auto_unsqueeze_time = auto_unsqueeze_time
+        )
+
+        if not return_fast_weights:
+            return out
+
+        return out, next_fast_weights
+
+    def forward(
+        self,
+        *args,
+        loss_mask: Tensor | None = None,
+        prev_fast_weights: Sequence[Params | None] | Params | None = None,
+        return_fast_weights: bool | None = None,
+        **kwargs
+    ):
+        return_fast_weights = default(return_fast_weights, exists(prev_fast_weights))
+
+        def before_forward(batch, time, args, kwargs, packed_args, packed_kwargs):
+            # sample action times if needed
+
+            if exists(self.times_arg) and not has_arg(args, kwargs, self.times_arg) and not has_arg(packed_args, packed_kwargs, self.times_arg):
+                sample_action_times_fn = default(self.sample_action_times_fn, sample_action_times)
+
+                # they give each batch time chunk its own noise, as in diffusion forcing - "sequence action forcing" in paper (0 noise -> 1 data)
+
+                noised_times = sample_action_times_fn(batch * time).to(self.device)
+                packed_args, packed_kwargs = set_arg(packed_args, packed_kwargs, self.times_arg, noised_times)
+
+            # unreduced loss for training if needed
+
+            if exists(self.unreduced_loss_arg) and not has_arg(args, kwargs, self.unreduced_loss_arg) and not has_arg(packed_args, packed_kwargs, self.unreduced_loss_arg):
+                packed_args, packed_kwargs = set_arg(packed_args, packed_kwargs, self.unreduced_loss_arg, True)
+
+            return packed_args, packed_kwargs
+
+        out, next_fast_weights = self._forward_with_time_packing(
+            self.model,
+            args,
+            kwargs,
+            prev_fast_weights = prev_fast_weights,
+            auto_unsqueeze_time = False,
+            before_forward_fn = before_forward
+        )
+
+        # reduce loss over extra dimensions past (batch, time) if needed
+
+        flat_out, tree_unflatten = tree_flatten_with_inverse(out)
+        loss = flat_out[self.loss_arg]
+
+        if is_tensor(loss) and loss.ndim > 2:
+            loss = reduce(loss, 'b t ... -> b t', 'mean')
+
+        # loss masking for imitation / dagger distillation - section 3.3
+
+        if exists(loss_mask):
+            assert loss_mask.ndim == 2, f'loss_mask must be 2d tensor of shape (batch, time)'
+            loss = masked_mean(loss, loss_mask)
+
+        flat_out[self.loss_arg] = loss
+        out = tree_unflatten(flat_out)
+
+        if not return_fast_weights:
+            return out
+
+        return out, next_fast_weights
