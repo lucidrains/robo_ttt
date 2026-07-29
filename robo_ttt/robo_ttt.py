@@ -324,7 +324,7 @@ class RoboTTT(Module):
         self,
         model: Module,
         *,
-        ttt_wrapper: TTTWrapper,
+        ttt_wrapper: TTTWrapper | Module,
         ttt_module_paths: ModulePaths = (),
         batch_time_arg = 0,
         expand_time_args: ArgKeys = (),

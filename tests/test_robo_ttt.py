@@ -588,3 +588,91 @@ def test_sample_auto_unsqueeze_time(auto_unsqueeze_time):
         assert actions_out.shape == (2, 1, 32, 4)
 
     assert len(fast_weights) == 1
+
+def test_custom_wrapper_lstm():
+    from einops import rearrange
+    from torch_einops_utils import pack_with_inverse
+    from mimic_video import MimicVideo
+    from robo_ttt import RoboTTT
+
+    class CustomLSTMTTTWrapper(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.lstm = nn.LSTM(dim, dim, batch_first = True)
+
+        def forward(self, action_chunks, prev_fast_weights = None):
+            action_chunks, unpack_time = pack_with_inverse(action_chunks, 'b * n d')
+            b, t, n, d = action_chunks.shape
+
+            x = rearrange(action_chunks, 'b t n d -> b (t n) d')
+
+            out, next_fast_weights = self.lstm(x, prev_fast_weights)
+
+            out = rearrange(out, 'b (t n) d -> b t n d', t = t, n = n)
+            return unpack_time(out), next_fast_weights, None
+
+    dim = 16
+    custom_wrapper = CustomLSTMTTTWrapper(dim)
+
+    policy = MimicVideo(
+        dim = dim,
+        dim_video_hidden = dim,
+        depth = 2,
+        dim_head = 8,
+        heads = 2,
+        dim_action = 4,
+        dim_joint_state = 4
+    )
+
+    model = RoboTTT(
+        policy,
+        ttt_wrapper = custom_wrapper,
+        ttt_module_paths = ('to_action_tokens',),
+        batch_time_arg = 'video_hiddens',
+        expand_time_args = ('prompt_token_ids',),
+        times_arg = 'time'
+    )
+
+    video_hiddens = torch.rand(2, 3, 5, dim)
+    joint_state = torch.randn(2, 3, 4)
+    actions = torch.randn(2, 3, 32, 4)
+    prompt_token_ids = torch.tensor([[10, 20, 30, -1], [15, 25, -1, -1]])
+
+    loss, fast_weights = model(
+        prompt_token_ids = prompt_token_ids,
+        video_hiddens = video_hiddens,
+        actions = actions,
+        joint_state = joint_state,
+        return_fast_weights = True
+    )
+
+    loss.sum().backward()
+
+    obs_hiddens = torch.randn(2, 5, dim)
+    obs_joint = torch.randn(2, 4)
+
+    actions_t1, fast_weights1 = model.sample(
+        prompt_token_ids = prompt_token_ids,
+        video_hiddens = obs_hiddens,
+        joint_state = obs_joint,
+        steps = 2,
+        batch_size = 2,
+        auto_unsqueeze_time = True,
+        return_fast_weights = True
+    )
+
+    actions_t2, fast_weights2 = model.sample(
+        prompt_token_ids = prompt_token_ids,
+        video_hiddens = obs_hiddens,
+        joint_state = obs_joint,
+        steps = 2,
+        batch_size = 2,
+        prev_fast_weights = fast_weights1,
+        auto_unsqueeze_time = True,
+        return_fast_weights = True
+    )
+
+    assert actions_t1.shape == (2, 32, 4)
+    assert actions_t2.shape == (2, 32, 4)
+    assert len(fast_weights1) == 1 and len(fast_weights2) == 1
+
