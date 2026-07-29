@@ -5,6 +5,9 @@ from torch import nn
 
 param = pytest.mark.parametrize
 
+def exists(t):
+    return t is not None
+
 def test_robo_ttt():
     from robo_ttt.robo_ttt import RoboTTT
 
@@ -19,7 +22,7 @@ def test_memory_key_value_bind(
     muon_param_names,
     learned_forget
 ):
-    from robo_ttt.robo_ttt import MemoryKeyValueBind, TTTWrapper, Attention
+    from robo_ttt.robo_ttt import MemoryKeyValueBind, TTTWrapper
 
     dim = 16
     memory_network = nn.Sequential(
@@ -49,11 +52,36 @@ def test_memory_key_value_bind(
 
     # ttt wrapper
 
-    block = Attention(dim)
-    wrapper = TTTWrapper(dim, memory = memory, block = block)
+    wrapper = TTTWrapper(dim, memory = memory)
 
     output1, next_fast_weights1, _ = wrapper(tokens)
     assert output1.shape == (2, 4, dim)
 
     output2, next_fast_weights2, _ = wrapper(tokens, prev_fast_weights = next_fast_weights1)
     assert output2.shape == (2, 4, dim)
+
+    # multiple action chunks (with time dimension)
+
+    multiple_chunks = torch.randn(2, 5, 4, dim)
+
+    multi_output1, multi_next_fast_weights1, _ = wrapper(multiple_chunks)
+    assert multi_output1.shape == (2, 5, 4, dim)
+
+    multi_output2, multi_next_fast_weights2, _ = wrapper(multiple_chunks, prev_fast_weights = multi_next_fast_weights1)
+    assert multi_output2.shape == (2, 5, 4, dim)
+
+    # assert equivalence between sequential (one at a time) vs multi-chunk (all at once)
+
+    seq_outputs = []
+    curr_fast_weights = None
+
+    for chunk in multiple_chunks.unbind(dim = 1):
+        out_chunk, curr_fast_weights, _ = wrapper(chunk, prev_fast_weights = curr_fast_weights)
+        seq_outputs.append(out_chunk)
+
+    seq_outputs = torch.stack(seq_outputs, dim = 1)
+
+    assert torch.allclose(multi_output1, seq_outputs, atol = 1e-5)
+
+    for k in multi_next_fast_weights1:
+        assert torch.allclose(multi_next_fast_weights1[k], curr_fast_weights[k], atol = 1e-5)

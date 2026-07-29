@@ -5,7 +5,7 @@ from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
-from torch import nn, Tensor, tensor
+from torch import nn, Tensor, tensor, stack
 from torch.nn import Module, Parameter, Linear
 from torch.func import grad, vmap, functional_call
 
@@ -13,7 +13,7 @@ from einx import multiply
 from einops import rearrange, repeat, einsum
 from einops.layers.torch import Rearrange, Reduce
 
-from torch_einops_utils import pack_with_inverse, tree_flatten_with_inverse, tree_map_detach
+from torch_einops_utils import pack_with_inverse, tree_map_detach
 
 # constants
 
@@ -28,6 +28,9 @@ def exists(t):
 
 def default(t, d):
     return t if exists(t) else d
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def add_dict(x, y):
     if not exists(x):
@@ -201,7 +204,7 @@ class MemoryKeyValueBind(Module):
 
 # ttt wrapper
 
-TTTWrapperIntermediates = namedtuple('TTTWrapperIntermediates', ('block_out', 'memory_out', 'next_fast_weights', 'delta_fast_weights'))
+TTTWrapperIntermediates = namedtuple('TTTWrapperIntermediates', ('memory_out', 'next_fast_weights', 'delta_fast_weights'))
 
 class TTTWrapper(Module):
 
@@ -209,121 +212,74 @@ class TTTWrapper(Module):
         self,
         dim,
         *,
-        memory: Module,  # they use key/value binding method, but make it customizable
-        block: Module,   # in paper, they wrap attention blocks
+        memory: Module, # the memory module type
+        tbptt_step_size: int | None = None
     ):
         super().__init__()
-        self.block = block
-
         self.memory = memory
-        self.memory_out_layerscale = nn.Parameter(torch.ones(dim) * 1e-4)
+        self.tbptt_step_size = tbptt_step_size
+        self.memory_out_layerscale = nn.Parameter(torch.randn(dim) * 1e-4)
 
     def forward(
         self,
-        tokens,
-        *args,
+        action_chunks, # (b t n d) | (b n d) - let it accept one action chunk, or multiple action chunks
         prev_fast_weights: Params | None = None,
-        detach_prev_fast_weights = False,
-        detach_next_fast_weights = False,
-        **kwargs
+        tbptt_step_size: int | None = None
     ):
+        tbptt_step_size = default(tbptt_step_size, self.tbptt_step_size)
 
-        # normal block out
+        action_chunks, maybe_unsqueeze_time = pack_with_inverse(action_chunks, 'b * n d')
 
-        block_out = self.block(tokens, *args, **kwargs)
+        # accumulate
 
-        # memory out
+        all_outputs = []
 
-        # maybe detach prev memories, give some flexibility to the researcher, can detach prev or next
+        for step, action_chunk in enumerate(rearrange(action_chunks, 'b t n d -> t b n d'), 1):
 
-        if detach_prev_fast_weights:
-            prev_fast_weights = tree_map_detach(prev_fast_weights)
+            # memory out
 
-        memory_out, delta_fast_weights = self.memory(tokens, prev_fast_weights)
+            memory_out, delta_fast_weights = self.memory(action_chunk, prev_fast_weights)
 
-        # block may return tuple
+            # they propose to tanh gate the ttt recurrent memory output, small initted
 
-        (block_out, *rest), unflatten_tree = tree_flatten_with_inverse(block_out)
+            chunk_out = action_chunk + memory_out * self.memory_out_layerscale.tanh()
 
-        # they propose to tanh gate the ttt recurrent memory output, small initted
+            all_outputs.append(chunk_out)
 
-        out = block_out + memory_out * self.memory_out_layerscale.tanh()
+            # add the fast weights
 
-        # add the fast weights
+            next_fast_weights = add_dict(prev_fast_weights, delta_fast_weights)
 
-        next_fast_weights = add_dict(prev_fast_weights, delta_fast_weights)
+            # set for next chunk
 
-        # detaching, give some flexibility to the researcher
+            prev_fast_weights = next_fast_weights
 
-        if detach_next_fast_weights:
-            next_fast_weights = tree_map_detach(next_fast_weights)
+            # truncated backprop through time (tbptt)
+
+            if exists(tbptt_step_size) and divisible_by(step, tbptt_step_size):
+                prev_fast_weights = tree_map_detach(prev_fast_weights)
 
         # intermediates
 
-        intermediates = TTTWrapperIntermediates(block_out, memory_out, next_fast_weights, delta_fast_weights)
+        intermediates = TTTWrapperIntermediates(memory_out, next_fast_weights, delta_fast_weights)
 
-        # bring back the caching from attention block
+        out = rearrange(all_outputs, 't b n d -> b t n d')
 
-        out = unflatten_tree((out, *rest))
+        # maybe remove time
+
+        out = maybe_unsqueeze_time(out)
 
         return out, next_fast_weights, intermediates
-
-# attention
-
-class Attention(Module):
-    def __init__(
-        self,
-        dim,
-        dim_context = None,
-        dim_head = 64,
-        heads = 8,
-        pre_rmsnorm = True
-    ):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        dim_context = default(dim_context, dim)
-        dim_inner = dim_head * heads
-
-        self.norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
-
-        self.to_q = LinearNoBias(dim, dim_inner)
-        self.to_kv = LinearNoBias(dim, dim_inner * 2)
-
-        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
-
-        self.merge_heads = Rearrange('b h n d -> b n (h d)')
-
-        self.to_out = LinearNoBias(dim_inner, dim)
-
-    def forward(
-        self,
-        tokens,
-        context = None,
-        mask = None
-    ):
-        tokens = self.norm(tokens)
-
-        context = default(context, tokens)
-
-        q = self.to_q(tokens)
-        kv = self.to_kv(context).chunk(2, dim = -1)
-
-        q, k, v = map(self.split_heads, (q, *kv))
-
-        sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
-        sim = sim * self.scale
-
-        attn = sim.softmax(dim = -1)
-
-        agg = einsum(attn, v, 'b h i j, b h j d -> b h i d')
-
-        out = self.merge_heads(agg)
-        return self.to_out(out)
 
 # classes
 
 class RoboTTT(Module):
     def __init__(
-        self
+        self,
+        vla: Module,
+        *,
+        ttt_wrapper: TTTWrapper,
     ):
         super().__init__()
+        self.vla = vla
+        self.ttt_wrapper = ttt_wrapper
