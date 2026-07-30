@@ -129,9 +129,12 @@ class MemoryKeyValueBind(Module):
         muon_param_names: Sequence[str] | None = None,
         learned_forget = True,
         rotary_embed_qk = True,
-        rope_kwargs: dict = dict(theta = 10000)
+        rope_kwargs: dict = dict(theta = 10000),
+        select_tokens_slice = None # optional custom slice of tokens within chunk to bind to memory (e.g. slice(1, None) to omit joint state or register tokens)
     ):
         super().__init__()
+
+        self.select_tokens_slice = select_tokens_slice
 
         # query key values
 
@@ -215,6 +218,11 @@ class MemoryKeyValueBind(Module):
 
         q, k, v = self.split_qkv(qkv)
 
+        # custom token sequence slicing if specified
+
+        if exists(self.select_tokens_slice):
+            q, k, v = map(lambda t: t[..., self.select_tokens_slice, :], (q, k, v))
+
         # position aware rotary embedding for queries and keys (Appendix A.1)
 
         if self.rotary_embed_qk:
@@ -275,6 +283,11 @@ class MemoryKeyValueBind(Module):
         next_memory_params = add_dict(delta_fast_weights, memory_params)
 
         retrieved = self.retrieve(next_memory_params, q)
+
+        if exists(self.select_tokens_slice):
+            full_retrieved = tokens.new_zeros(tokens.shape)
+            full_retrieved[..., self.select_tokens_slice, :] = retrieved
+            retrieved = full_retrieved
 
         return retrieved, delta_fast_weights
 

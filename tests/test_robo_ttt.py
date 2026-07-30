@@ -12,11 +12,13 @@ def exists(t):
 @param('muon_param_names', [None, ('0.weight',)])
 @param('learned_forget', [False, True])
 @param('rotary_embed', [False, True])
+@param('select_tokens_slice', [None, slice(1, None)])
 def test_memory_key_value_bind(
     muon_update,
     muon_param_names,
     learned_forget,
-    rotary_embed
+    rotary_embed,
+    select_tokens_slice
 ):
     from robo_ttt.robo_ttt import MemoryKeyValueBind, TTTWrapper
 
@@ -33,7 +35,8 @@ def test_memory_key_value_bind(
         muon_update = muon_update,
         muon_param_names = muon_param_names,
         learned_forget = learned_forget,
-        rotary_embed_qk = rotary_embed
+        rotary_embed_qk = rotary_embed,
+        select_tokens_slice = select_tokens_slice
     )
 
     tokens = torch.randn(2, 4, dim)
