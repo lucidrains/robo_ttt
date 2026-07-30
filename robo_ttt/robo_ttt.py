@@ -18,6 +18,8 @@ from einops.layers.torch import Rearrange, Reduce
 from torch_einops_utils import pack_with_inverse, tree_map_detach, tree_map_tensor, tree_flatten_with_inverse, masked_mean
 from torch_einops_utils.device import module_device
 
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+
 # constants
 
 Params = dict[str, Tensor]
@@ -25,8 +27,18 @@ ArgKey = int | str
 ArgKeys = Sequence[ArgKey]
 ModulePaths = Sequence[str] | str
 
-# helpers
+# memory namedtuple holding fast weights parameters and total sequence step position
 
+Memory = namedtuple('Memory', ('fast_weights', 'step'))
+
+def normalize_memory(memory):
+    if not exists(memory):
+        return Memory(None, 0)
+    if isinstance(memory, Memory):
+        return memory
+    return Memory(memory, 0)
+
+# helpers
 
 def exists(t):
     return t is not None
@@ -115,7 +127,9 @@ class MemoryKeyValueBind(Module):
         memory_net: Module,
         muon_update = False,
         muon_param_names: Sequence[str] | None = None,
-        learned_forget = False
+        learned_forget = True,
+        rotary_embed_qk = True,
+        rope_kwargs: dict = dict(theta = 10000)
     ):
         super().__init__()
 
@@ -126,7 +140,14 @@ class MemoryKeyValueBind(Module):
             nn.Linear(dim, dim * 3)
         )
 
-        self.split_qkv = Rearrange('b n (qkv d) -> qkv b n d', qkv = 3)
+        self.split_qkv = Rearrange('b ... (qkv d) -> qkv b ... d', qkv = 3)
+
+        # position aware with rope
+
+        self.rotary_embed_qk = rotary_embed_qk
+
+        if rotary_embed_qk:
+            self.rotary_emb = RotaryEmbedding(dim = dim, **rope_kwargs)
 
         # the memory
 
@@ -179,9 +200,12 @@ class MemoryKeyValueBind(Module):
 
     def forward(
         self,
-        tokens: Tensor,
-        prev_fast_weights: Params | None = None
-    ) -> tuple[Tensor, Params]:
+        tokens,
+        prev_fast_weights = None
+    ):
+
+        prev_memory = normalize_memory(prev_fast_weights)
+        fast_weights, step = prev_memory.fast_weights, prev_memory.step
 
         batch, muon_update, should_forget = tokens.shape[0], self.muon_update, self.learned_forget
 
@@ -191,11 +215,30 @@ class MemoryKeyValueBind(Module):
 
         q, k, v = self.split_qkv(qkv)
 
+        # position aware rotary embedding for queries and keys (Appendix A.1)
+
+        if self.rotary_embed_qk:
+            seq_dim = -2
+            seq_len = 1
+
+            if q.ndim == 4:
+                seq_dim = 1
+                seq_len = q.shape[1]
+
+            seq_pos = self.rotary_emb.get_seq_pos(seq_len, offset = step, device = q.device)
+            freqs = self.rotary_emb(seq_pos)
+
+            if seq_dim == 1:
+                freqs = rearrange(freqs, 't d -> t 1 d')
+
+            q = apply_rotary_emb(freqs, q, seq_dim = seq_dim)
+            k = apply_rotary_emb(freqs, k, seq_dim = seq_dim)
+
         # constitute the params from accumulated fast weights and base params
 
         base_memory_params = {param_name: repeat(param, '... -> b ...', b = batch) for param_name, param in self.base_memory_params.items()}
 
-        memory_params = add_dict(prev_fast_weights, base_memory_params)
+        memory_params = add_dict(fast_weights, base_memory_params)
 
         # get the next generated fast weights from the surprise
 
@@ -246,7 +289,7 @@ class TTTWrapper(Module):
         dim,
         *,
         memory: Module, # the memory module type
-        tbptt_step_size: int | None = None
+        tbptt_step_size = None
     ):
         super().__init__()
         self.memory = memory
@@ -256,12 +299,14 @@ class TTTWrapper(Module):
     def forward(
         self,
         action_chunks, # (b t n d) | (b n d) - let it accept one action chunk, or multiple action chunks
-        prev_fast_weights: Params | None = None,
-        tbptt_step_size: int | None = None
+        prev_fast_weights = None,
+        tbptt_step_size = None
     ):
         tbptt_step_size = default(tbptt_step_size, self.tbptt_step_size)
 
         action_chunks, maybe_unsqueeze_time = pack_with_inverse(action_chunks, 'b * n d')
+
+        curr_memory = normalize_memory(prev_fast_weights)
 
         # accumulate
 
@@ -271,7 +316,7 @@ class TTTWrapper(Module):
 
             # memory out
 
-            memory_out, delta_fast_weights = self.memory(action_chunk, prev_fast_weights)
+            memory_out, delta_fast_weights = self.memory(action_chunk, curr_memory)
 
             # they propose to tanh gate the ttt recurrent memory output, small initted
 
@@ -279,20 +324,19 @@ class TTTWrapper(Module):
 
             all_outputs.append(chunk_out)
 
-            # add the fast weights
+            # add the fast weights and advance sequence step
 
-            next_fast_weights = add_dict(prev_fast_weights, delta_fast_weights)
+            next_fast_weights = add_dict(curr_memory.fast_weights, delta_fast_weights)
+            next_step = curr_memory.step + 1
 
-            # set for next chunk
-
-            prev_fast_weights = next_fast_weights
+            curr_memory = Memory(next_fast_weights, next_step)
 
             # truncated backprop through time (tbptt)
 
             if exists(tbptt_step_size) and divisible_by(step, tbptt_step_size):
-                prev_fast_weights = tree_map_detach(prev_fast_weights)
+                curr_memory = Memory(tree_map_detach(curr_memory.fast_weights), curr_memory.step)
 
-        # intermediates
+        next_fast_weights = curr_memory
 
         intermediates = TTTWrapperIntermediates(memory_out, next_fast_weights, delta_fast_weights)
 
@@ -365,7 +409,7 @@ class RoboTTT(Module):
     def _normalize_prev_fast_weights(self, prev_fast_weights):
         prev_fast_weights = cast_tuple(default(prev_fast_weights, self.default_prev_fast_weights))
         assert len(prev_fast_weights) == len(self.ttt_wrappers)
-        return prev_fast_weights
+        return tuple(normalize_memory(fw) for fw in prev_fast_weights)
 
     def _forward_with_ttt(self, fn: Callable, args: tuple, kwargs: dict, time: int, prev_fast_weights):
         handles = []
@@ -494,10 +538,10 @@ class RoboTTT(Module):
     def sample(
         self,
         *args,
-        sample_fn_name: str | None = None,
-        prev_fast_weights: Sequence[Params | None] | Params | None = None,
-        return_fast_weights: bool | None = None,
-        auto_unsqueeze_time: bool = True,
+        sample_fn_name = None,
+        prev_fast_weights = None,
+        return_fast_weights = None,
+        auto_unsqueeze_time = True,
         **kwargs
     ):
         return_fast_weights = default(return_fast_weights, exists(prev_fast_weights))
@@ -523,9 +567,9 @@ class RoboTTT(Module):
     def forward(
         self,
         *args,
-        loss_mask: Tensor | None = None,
-        prev_fast_weights: Sequence[Params | None] | Params | None = None,
-        return_fast_weights: bool | None = None,
+        loss_mask = None,
+        prev_fast_weights = None,
+        return_fast_weights = None,
         **kwargs
     ):
         return_fast_weights = default(return_fast_weights, exists(prev_fast_weights))

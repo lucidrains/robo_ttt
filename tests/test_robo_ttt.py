@@ -11,10 +11,12 @@ def exists(t):
 @param('muon_update', [False, True])
 @param('muon_param_names', [None, ('0.weight',)])
 @param('learned_forget', [False, True])
+@param('rotary_embed', [False, True])
 def test_memory_key_value_bind(
     muon_update,
     muon_param_names,
-    learned_forget
+    learned_forget,
+    rotary_embed
 ):
     from robo_ttt.robo_ttt import MemoryKeyValueBind, TTTWrapper
 
@@ -30,7 +32,8 @@ def test_memory_key_value_bind(
         memory_network,
         muon_update = muon_update,
         muon_param_names = muon_param_names,
-        learned_forget = learned_forget
+        learned_forget = learned_forget,
+        rotary_embed_qk = rotary_embed
     )
 
     tokens = torch.randn(2, 4, dim)
@@ -50,9 +53,11 @@ def test_memory_key_value_bind(
 
     output1, next_fast_weights1, _ = wrapper(tokens)
     assert output1.shape == (2, 4, dim)
+    assert next_fast_weights1.step == 1
 
     output2, next_fast_weights2, _ = wrapper(tokens, prev_fast_weights = next_fast_weights1)
     assert output2.shape == (2, 4, dim)
+    assert next_fast_weights2.step == 2
 
     # multiple action chunks (with time dimension)
 
@@ -60,9 +65,11 @@ def test_memory_key_value_bind(
 
     multi_output1, multi_next_fast_weights1, _ = wrapper(multiple_chunks)
     assert multi_output1.shape == (2, 5, 4, dim)
+    assert multi_next_fast_weights1.step == 5
 
     multi_output2, multi_next_fast_weights2, _ = wrapper(multiple_chunks, prev_fast_weights = multi_next_fast_weights1)
     assert multi_output2.shape == (2, 5, 4, dim)
+    assert multi_next_fast_weights2.step == 10
 
     # assert equivalence between sequential (one at a time) vs multi-chunk (all at once)
 
@@ -77,8 +84,9 @@ def test_memory_key_value_bind(
 
     assert torch.allclose(multi_output1, seq_outputs, atol = 1e-5)
 
-    for k in multi_next_fast_weights1:
-        assert torch.allclose(multi_next_fast_weights1[k], curr_fast_weights[k], atol = 1e-5)
+    assert multi_next_fast_weights1.step == curr_fast_weights.step == 5
+    for k in multi_next_fast_weights1.fast_weights:
+        assert torch.allclose(multi_next_fast_weights1.fast_weights[k], curr_fast_weights.fast_weights[k], atol = 1e-5)
 
 def test_readme_basic_example():
     from robo_ttt import MemoryKeyValueBind, TTTWrapper
@@ -267,7 +275,8 @@ def test_robo_ttt_loss_mask(has_loss_mask):
     else:
         assert loss.shape == (2, 3)
 
-def test_robo_ttt_time_sequence_equivalence():
+@param('rotary_embed', [False, True])
+def test_robo_ttt_time_sequence_equivalence(rotary_embed):
     from mimic_video import MimicVideo
     from robo_ttt.robo_ttt import RoboTTT, MemoryKeyValueBind, TTTWrapper
 
@@ -278,7 +287,7 @@ def test_robo_ttt_time_sequence_equivalence():
         nn.Linear(32, dim)
     )
 
-    memory = MemoryKeyValueBind(dim, memory_network)
+    memory = MemoryKeyValueBind(dim, memory_network, rotary_embed_qk = rotary_embed)
     wrapper = TTTWrapper(dim, memory = memory)
 
     vam_model = MimicVideo(
@@ -359,9 +368,10 @@ def test_robo_ttt_time_sequence_equivalence():
 
     assert len(next_fast_weights_full) == len(next_fast_weights_chunk2) == 1
 
-    for layer_fast_weights_full, layer_fast_weights_chunk2 in zip(next_fast_weights_full, next_fast_weights_chunk2):
-        for k in layer_fast_weights_full:
-            assert torch.allclose(layer_fast_weights_full[k], layer_fast_weights_chunk2[k], atol = 1e-5)
+    for layer_mem_full, layer_mem_chunk2 in zip(next_fast_weights_full, next_fast_weights_chunk2):
+        assert layer_mem_full.step == layer_mem_chunk2.step == 5
+        for k in layer_mem_full.fast_weights:
+            assert torch.allclose(layer_mem_full.fast_weights[k], layer_mem_chunk2.fast_weights[k], atol = 1e-5)
 
 def test_robo_ttt_sample():
     from mimic_video import MimicVideo
@@ -593,7 +603,7 @@ def test_custom_wrapper_lstm():
     from einops import rearrange
     from torch_einops_utils import pack_with_inverse
     from mimic_video import MimicVideo
-    from robo_ttt import RoboTTT
+    from robo_ttt.robo_ttt import RoboTTT, Memory, normalize_memory
 
     class CustomLSTMTTTWrapper(nn.Module):
         def __init__(self, dim):
@@ -601,15 +611,17 @@ def test_custom_wrapper_lstm():
             self.lstm = nn.LSTM(dim, dim, batch_first = True)
 
         def forward(self, action_chunks, prev_fast_weights = None):
+            curr_memory = normalize_memory(prev_fast_weights)
+
             action_chunks, unpack_time = pack_with_inverse(action_chunks, 'b * n d')
             b, t, n, d = action_chunks.shape
 
             x = rearrange(action_chunks, 'b t n d -> b (t n) d')
 
-            out, next_fast_weights = self.lstm(x, prev_fast_weights)
+            out, next_fast_weights = self.lstm(x, curr_memory.fast_weights)
 
             out = rearrange(out, 'b (t n) d -> b t n d', t = t, n = n)
-            return unpack_time(out), next_fast_weights, None
+            return unpack_time(out), Memory(next_fast_weights, curr_memory.step + t), None
 
     dim = 16
     custom_wrapper = CustomLSTMTTTWrapper(dim)
@@ -675,4 +687,3 @@ def test_custom_wrapper_lstm():
     assert actions_t1.shape == (2, 32, 4)
     assert actions_t2.shape == (2, 32, 4)
     assert len(fast_weights1) == 1 and len(fast_weights2) == 1
-
