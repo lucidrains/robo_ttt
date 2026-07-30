@@ -419,6 +419,9 @@ class RoboTTT(Module):
     def device(self):
         return module_device(self)
 
+    def finetune_parameters(self):
+        return self.ttt_wrappers.parameters()
+
     def _normalize_prev_fast_weights(self, prev_fast_weights):
         prev_fast_weights = cast_tuple(default(prev_fast_weights, self.default_prev_fast_weights))
         assert len(prev_fast_weights) == len(self.ttt_wrappers)

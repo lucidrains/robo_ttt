@@ -690,3 +690,45 @@ def test_custom_wrapper_lstm():
     assert actions_t1.shape == (2, 32, 4)
     assert actions_t2.shape == (2, 32, 4)
     assert len(fast_weights1) == 1 and len(fast_weights2) == 1
+
+def test_finetune_parameters():
+    from mimic_video import MimicVideo
+    from robo_ttt import RoboTTT, MemoryKeyValueBind, TTTWrapper
+
+    dim = 16
+    memory_network = nn.Sequential(
+        nn.Linear(dim, 32),
+        nn.GELU(),
+        nn.Linear(32, dim)
+    )
+
+    memory = MemoryKeyValueBind(dim, memory_network)
+    ttt_wrapper = TTTWrapper(dim, memory = memory)
+
+    policy = MimicVideo(
+        dim = dim,
+        dim_video_hidden = dim,
+        depth = 2,
+        dim_head = 8,
+        heads = 2,
+        dim_action = 4,
+        dim_joint_state = 4
+    )
+
+    model = RoboTTT(
+        policy,
+        ttt_wrapper = ttt_wrapper,
+        ttt_module_paths = ('to_action_tokens',),
+        batch_time_arg = 'video_hiddens',
+        expand_time_args = ('prompt_token_ids',),
+        times_arg = 'time'
+    )
+
+    finetune_params = list(model.finetune_parameters())
+    ttt_wrapper_params = list(model.ttt_wrappers.parameters())
+    policy_params = list(policy.parameters())
+
+    assert len(finetune_params) > 0
+    assert set(finetune_params) == set(ttt_wrapper_params)
+    assert not any(p in set(policy_params) for p in finetune_params)
+
