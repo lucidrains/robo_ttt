@@ -31,14 +31,34 @@ memory_network = nn.Sequential(
 memory = MemoryKeyValueBind(512, memory_network)
 ttt_wrapper = TTTWrapper(512, memory = memory)
 
-# attended action tokens for multiple action chunks over time (batch = 2, time = 5, seq_len = 4, dim = 512)
-# TTT-KVB is placed at the output of attention layers in the action transformer
+# attended action chunks over time (batch = 2, time = 5, seq_len = 4, dim = 512)
 
 attended_action_chunks = torch.randn(2, 5, 4, 512)
 
 out, next_fast_weights, _ = ttt_wrapper(attended_action_chunks)
 
 assert out.shape == attended_action_chunks.shape
+```
+
+You can also drop in [Fast Weight Product Key Memory](https://arxiv.org/abs/2601.00671) (Tianyu Zhao & Llion Jones) directly via `fwPKMWrapper`:
+
+```python
+import torch
+
+from robo_ttt import fwPKMWrapper, TTTWrapper
+from fast_weight_product_key_memory import fwPKM
+
+pkm = fwPKM(
+    dim = 512,
+    num_memories = 256 * 256,
+    dim_queries_keys = 512,
+    dim_values = 512
+)
+memory = fwPKMWrapper(pkm)
+ttt_wrapper = TTTWrapper(512, memory = memory)
+
+attended_action_chunks = torch.randn(2, 5, 4, 512)
+out, next_fast_weights, _ = ttt_wrapper(attended_action_chunks)
 ```
 
 ### Full Policy Wrapper with MimicVideo
@@ -125,5 +145,17 @@ actions_t1, fast_weights1 = model.sample(
     author  = {Yunfan Jiang and Yevgen Chebotar and Ruijie Zheng and Fengyuan Hu and Yunhao Ge and Jimmy Wu and Tianyuan Dai and Scott Reed and Li Fei-Fei and Yuke Zhu and Linxi "Jim" Fan},
     year    = {2026},
     journal = {arXiv preprint arXiv: 2607.15275}
+}
+```
+
+```bibtex
+@misc{zhao2026fastweightproductkeymemory,
+    title   = {Fast-weight Product Key Memory},
+    author  = {Tianyu Zhao and Llion Jones},
+    year    = {2026},
+    eprint  = {2601.00671},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL},
+    url     = {https://arxiv.org/abs/2601.00671},
 }
 ```

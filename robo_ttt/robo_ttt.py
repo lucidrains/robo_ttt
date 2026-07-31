@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from copy import deepcopy
 from functools import partial
 from collections import namedtuple
@@ -80,6 +81,8 @@ def has_arg(args: tuple, kwargs: dict, arg_key: ArgKey):
 def add_dict(x, y):
     if not exists(x):
         return y
+    if not exists(y):
+        return x
 
     return {k: x[k] + y[k] for k in x.keys()}
 
@@ -291,6 +294,46 @@ class MemoryKeyValueBind(Module):
 
         return retrieved, delta_fast_weights
 
+# fwpkm memory wrapper - Llion Jones paper at Sakana AI (https://arxiv.org/abs/2601.00671)
+
+class fwPKMWrapper(Module):
+    def __init__(
+        self,
+        fw_pkm: Module
+    ):
+        super().__init__()
+        self.fw_pkm = fw_pkm
+
+    def forward(
+        self,
+        tokens,
+        prev_fast_weights = None
+    ):
+        from fast_weight_product_key_memory.fwPKM import Memories
+
+        past_memories = None
+
+        if exists(prev_fast_weights):
+            fw = normalize_memory(prev_fast_weights).fast_weights
+            if exists(fw):
+                past_memories = Memories(fw['memory_values'], fw['keys']) if isinstance(fw, dict) else fw
+
+        out, next_memories = self.fw_pkm(
+            tokens,
+            past_memories = past_memories,
+            return_next_memories = True
+        )
+
+        mv, keys = next_memories.memory_values, next_memories.keys
+
+        if exists(past_memories):
+            mv = mv - past_memories.memory_values
+            keys = keys - past_memories.keys
+
+        delta_fast_weights = dict(memory_values = mv, keys = keys)
+
+        return out, delta_fast_weights
+
 # ttt wrapper
 
 TTTWrapperIntermediates = namedtuple('TTTWrapperIntermediates', ('memory_out', 'next_fast_weights', 'delta_fast_weights'))
@@ -302,10 +345,12 @@ class TTTWrapper(Module):
         dim,
         *,
         memory: Module, # the memory module type
+        select_tokens_slice = None,
         tbptt_step_size = None
     ):
         super().__init__()
         self.memory = memory
+        self.select_tokens_slice = select_tokens_slice
         self.tbptt_step_size = tbptt_step_size
         self.memory_out_layerscale = nn.Parameter(torch.randn(dim) * 1e-4)
 
@@ -329,7 +374,17 @@ class TTTWrapper(Module):
 
             # memory out
 
-            memory_out, delta_fast_weights = self.memory(action_chunk, curr_memory)
+            input_chunk = action_chunk
+
+            if exists(self.select_tokens_slice):
+                input_chunk = action_chunk[..., self.select_tokens_slice, :]
+
+            memory_out, delta_fast_weights = self.memory(input_chunk, curr_memory)
+
+            if exists(self.select_tokens_slice):
+                full_memory_out = action_chunk.new_zeros(action_chunk.shape)
+                full_memory_out[..., self.select_tokens_slice, :] = memory_out
+                memory_out = full_memory_out
 
             # they propose to tanh gate the ttt recurrent memory output, small initted
 
@@ -406,9 +461,25 @@ class RoboTTT(Module):
         self.sample_action_times_fn = sample_action_times_fn
 
         # ttt wrappers for designated submodules
+        # ttt_module_paths can contain string paths or (memory_index, path) tuples to route specific wrappers to layers
 
-        self.ttt_module_paths = cast_tuple(ttt_module_paths)
-        self.ttt_wrappers = ModuleList([deepcopy(ttt_wrapper) for _ in self.ttt_module_paths])
+        wrappers = cast_tuple(ttt_wrapper)
+        raw_module_paths = cast_tuple(ttt_module_paths)
+
+        resolved_wrappers = []
+        resolved_paths = []
+
+        for item in raw_module_paths:
+            if not isinstance(item, tuple):
+                item = (0 if len(wrappers) == 1 else len(resolved_paths), item)
+
+            wrapper_idx, path = item
+
+            resolved_wrappers.append(deepcopy(wrappers[wrapper_idx]))
+            resolved_paths.append(path)
+
+        self.ttt_wrappers = ModuleList(resolved_wrappers)
+        self.ttt_module_paths = tuple(resolved_paths)
         self.submodules = [model.get_submodule(path) for path in self.ttt_module_paths]
 
         # default prev fast weights
@@ -476,7 +547,10 @@ class RoboTTT(Module):
         assert is_tensor(target) and target.ndim >= 2, f'batch_time_arg target must be a tensor of at least 2 dimensions'
         batch, time = target.shape[:2]
 
-        pack_batch_time = partial(rearrange, pattern = 'b t ... -> (b t) ...')
+        def pack_batch_time(t):
+            if not is_tensor(t) or t.ndim < 2:
+                return t
+            return rearrange(t, 'b t ... -> (b t) ...')
 
         def unpack_batch_time(t):
             if not is_tensor(t) or t.ndim == 0:
