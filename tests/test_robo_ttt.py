@@ -278,9 +278,9 @@ def test_robo_ttt_loss_mask(has_loss_mask):
     else:
         assert loss.shape == (2, 3)
 
+@param('use_prompt_token_ids', [False, True])
 @param('rotary_embed', [False, True])
-def test_robo_ttt_time_sequence_equivalence(rotary_embed):
-    from mimic_video import MimicVideo
+def test_robo_ttt_time_sequence_equivalence(use_prompt_token_ids, rotary_embed):
     from robo_ttt.robo_ttt import RoboTTT, MemoryKeyValueBind, TTTWrapper
 
     dim = 16
@@ -293,18 +293,25 @@ def test_robo_ttt_time_sequence_equivalence(rotary_embed):
     memory = MemoryKeyValueBind(dim, memory_network, rotary_embed_qk = rotary_embed)
     wrapper = TTTWrapper(dim, memory = memory)
 
-    vam_model = MimicVideo(
-        dim = dim,
-        dim_video_hidden = dim,
-        depth = 2,
-        dim_head = 8,
-        heads = 2,
-        dim_action = 4,
-        dim_joint_state = 4
-    )
+    class ToyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.to_action_tokens = nn.Linear(dim, dim)
+            self.prompt_embed = nn.Embedding(64, dim, padding_idx = 0)
+
+        def forward(self, prompt_token_ids, video_hiddens, time = None, return_unreduced_loss = False):
+
+            prompt_emb = self.prompt_embed(prompt_token_ids).mean(dim = -2) if use_prompt_token_ids else None
+
+            out = self.to_action_tokens(video_hiddens)
+
+            if exists(prompt_emb):
+                out = out + prompt_emb[:, None, :]
+
+            return (out ** 2).mean(dim = -1)
 
     model = RoboTTT(
-        vam_model,
+        ToyPolicy(),
         ttt_wrapper = wrapper,
         ttt_module_paths = ('to_action_tokens',),
         batch_time_arg = 'video_hiddens',
@@ -315,9 +322,7 @@ def test_robo_ttt_time_sequence_equivalence(rotary_embed):
     # full sequence of t = 5 timesteps (b = 2, t = 5)
 
     video_hiddens = torch.rand(2, 5, 5, dim)
-    joint_state = torch.randn(2, 5, 4)
-    actions = torch.randn(2, 5, 32, 4)
-    prompt_token_ids = torch.tensor([[10, 20, 30, -1], [15, 25, -1, -1]])
+    prompt_token_ids = torch.tensor([[10, 20, 30, 0], [15, 25, 0, 0]])
     time = torch.rand(2, 5)
 
     # 1. process full sequence all at once (t = 5)
@@ -327,8 +332,6 @@ def test_robo_ttt_time_sequence_equivalence(rotary_embed):
     out_full, next_fast_weights_full = model(
         prompt_token_ids = prompt_token_ids,
         video_hiddens = video_hiddens,
-        actions = actions,
-        joint_state = joint_state,
         time = time,
         return_unreduced_loss = True,
         return_fast_weights = True
@@ -341,8 +344,6 @@ def test_robo_ttt_time_sequence_equivalence(rotary_embed):
     out_chunk1, next_fast_weights_chunk1 = model(
         prompt_token_ids = prompt_token_ids,
         video_hiddens = video_hiddens[:, :2],
-        actions = actions[:, :2],
-        joint_state = joint_state[:, :2],
         time = time[:, :2],
         return_unreduced_loss = True,
         return_fast_weights = True
@@ -353,8 +354,6 @@ def test_robo_ttt_time_sequence_equivalence(rotary_embed):
     out_chunk2, next_fast_weights_chunk2 = model(
         prompt_token_ids = prompt_token_ids,
         video_hiddens = video_hiddens[:, 2:],
-        actions = actions[:, 2:],
-        joint_state = joint_state[:, 2:],
         time = time[:, 2:],
         prev_fast_weights = next_fast_weights_chunk1,
         return_unreduced_loss = True,

@@ -1,6 +1,6 @@
 [project]
 name = "robo-ttt"
-version = "0.1.0"
+version = "0.1.2"
 description = "RoboTTT - Context Scaling for Robot Policies"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

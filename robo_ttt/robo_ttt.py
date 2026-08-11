@@ -76,6 +76,13 @@ def has_arg(args: tuple, kwargs: dict, arg_key: ArgKey):
 
     return arg_key in kwargs
 
+def map_args(args: tuple, kwargs: dict, fn: Callable):
+    # apply fn to each arg and kwarg, dispatching on key type (int positional, str keyword)
+
+    args = tuple(fn(idx, arg) for idx, arg in enumerate(args))
+    kwargs = {key: fn(key, val) for key, val in kwargs.items()}
+    return args, kwargs
+
 # tensor helpers
 
 def add_dict(x, y):
@@ -455,6 +462,7 @@ class RoboTTT(Module):
         self.batch_time_arg = batch_time_arg
         self.expand_time_args = set(expand_time_args)
         self.omit_time_args = set(omit_time_args)
+        self.non_temporal_keys = self.expand_time_args | self.omit_time_args
         self.times_arg = times_arg
         self.unreduced_loss_arg = unreduced_loss_arg
         self.loss_arg = loss_arg
@@ -578,11 +586,9 @@ class RoboTTT(Module):
         # auto unsqueeze time dimension 1 for single-timestep sampling inputs if flag is set
 
         if auto_unsqueeze_time:
-            non_temporal_keys = self.omit_time_args | self.expand_time_args
             unsqueeze_time = lambda t: rearrange(t, 'b ... -> b 1 ...')
 
-            args = tuple(arg if idx in non_temporal_keys else tree_map_tensor(unsqueeze_time, arg) for idx, arg in enumerate(args))
-            kwargs = {k: (v if k in non_temporal_keys else tree_map_tensor(unsqueeze_time, v)) for k, v in kwargs.items()}
+            args, kwargs = map_args(args, kwargs, lambda key, val: val if key in self.non_temporal_keys else tree_map_tensor(unsqueeze_time, val))
 
         # normalize fast weights
 
@@ -592,22 +598,16 @@ class RoboTTT(Module):
 
         batch, time, pack_batch_time, unpack_batch_time = self._get_batch_time(args, kwargs)
 
-        # expand non-temporal args across time if needed
+        # transform each arg once: repeat across time (expand), pass through (omit), or pack time into batch
 
-        for arg_key in self.expand_time_args:
-            val = tree_map_tensor(lambda t: repeat(t, 'b ... -> (b t) ...', t = time), get_arg(args, kwargs, arg_key))
-            args, kwargs = set_arg(args, kwargs, arg_key, val)
+        def transform_arg(key, val):
+            if key in self.expand_time_args:
+                return tree_map_tensor(lambda t: repeat(t, 'b ... -> (b t) ...', t = time), val)
+            if key in self.omit_time_args:
+                return val
+            return tree_map_tensor(pack_batch_time, val)
 
-        # omit non-temporal args from time-packing
-
-        omitted = {arg_key: get_arg(args, kwargs, arg_key) for arg_key in self.omit_time_args if has_arg(args, kwargs, arg_key)}
-
-        # pack time into batch dimension
-
-        packed_args, packed_kwargs = tree_map_tensor(pack_batch_time, (args, kwargs))
-
-        for arg_key, val in omitted.items():
-            packed_args, packed_kwargs = set_arg(packed_args, packed_kwargs, arg_key, val)
+        packed_args, packed_kwargs = map_args(args, kwargs, transform_arg)
 
         if exists(before_forward_fn):
             packed_args, packed_kwargs = before_forward_fn(batch, time, args, kwargs, packed_args, packed_kwargs)
