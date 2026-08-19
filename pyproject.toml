@@ -1,6 +1,6 @@
 [project]
 name = "robo-ttt"
-version = "0.1.2"
+version = "0.1.4"
 description = "RoboTTT - Context Scaling for Robot Policies"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -27,6 +27,7 @@ classifiers=[
 dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.1",
+    "fast-weight-product-key-memory>=0.2.1",
     "rotary-embedding-torch",
     "torch>=2.5",
     "torch-einops-utils>=0.1.12"
