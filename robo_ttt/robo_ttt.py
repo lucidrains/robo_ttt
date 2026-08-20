@@ -306,10 +306,13 @@ class MemoryKeyValueBind(Module):
 class fwPKMWrapper(Module):
     def __init__(
         self,
-        fw_pkm: Module
+        fw_pkm: Module,
+        *,
+        use_delta_fast_weights = True
     ):
         super().__init__()
         self.fw_pkm = fw_pkm
+        self.use_delta_fast_weights = use_delta_fast_weights
 
     def forward(
         self,
@@ -333,13 +336,60 @@ class fwPKMWrapper(Module):
 
         mv, keys = next_memories.memory_values, next_memories.keys
 
-        if exists(past_memories):
+        if self.use_delta_fast_weights and exists(past_memories):
             mv = mv - past_memories.memory_values
             keys = keys - past_memories.keys
 
         delta_fast_weights = dict(memory_values = mv, keys = keys)
 
         return out, delta_fast_weights
+
+# fwa memory wrapper
+
+class fWAWrapper(Module):
+    def __init__(
+        self,
+        fwa: Module,
+        *,
+        use_delta_fast_weights = False
+    ):
+        super().__init__()
+        self.fwa = fwa
+        self.use_delta_fast_weights = use_delta_fast_weights
+
+    def forward(
+        self,
+        tokens,
+        prev_fast_weights = None
+    ):
+        from fast_weight_attention import FastWeightState
+
+        past_state = None
+
+        if exists(prev_fast_weights):
+            fw = normalize_memory(prev_fast_weights).fast_weights
+            if exists(fw):
+                if isinstance(fw, dict):
+                    token_count = fw.get('token_count', 0)
+                    memory = {k: v for k, v in fw.items() if k != 'token_count'}
+                    past_state = FastWeightState(memory, token_count)
+                else:
+                    past_state = FastWeightState(fw)
+
+        out, next_state = self.fwa(
+            tokens,
+            past_mem = past_state,
+            return_next_memories = True
+        )
+
+        next_memories = dict(next_state.memory)
+
+        if self.use_delta_fast_weights and exists(past_state):
+            next_memories = {k: v - past_state.memory[k] for k, v in next_memories.items()}
+        else:
+            next_memories['token_count'] = next_state.token_count
+
+        return out, next_memories
 
 # ttt wrapper
 
@@ -353,13 +403,15 @@ class TTTWrapper(Module):
         *,
         memory: Module, # the memory module type
         select_tokens_slice = None,
-        tbptt_step_size = None
+        tbptt_step_size = None,
+        use_delta_fast_weights = None # whether the memory module returns the change in fast weights (delta) or the full next state; defaults to the memory module's convention
     ):
         super().__init__()
         self.memory = memory
         self.select_tokens_slice = select_tokens_slice
         self.tbptt_step_size = tbptt_step_size
         self.memory_out_layerscale = nn.Parameter(torch.randn(dim) * 1e-4)
+        self.use_delta_fast_weights = default(use_delta_fast_weights, getattr(self.memory, 'use_delta_fast_weights', True))
 
     def forward(
         self,
@@ -401,7 +453,11 @@ class TTTWrapper(Module):
 
             # add the fast weights and advance sequence step
 
-            next_fast_weights = add_dict(curr_memory.fast_weights, delta_fast_weights)
+            if self.use_delta_fast_weights:
+                next_fast_weights = add_dict(curr_memory.fast_weights, delta_fast_weights)
+            else:
+                next_fast_weights = delta_fast_weights
+
             next_step = curr_memory.step + 1
 
             curr_memory = Memory(next_fast_weights, next_step)

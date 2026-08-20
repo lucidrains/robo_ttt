@@ -815,3 +815,88 @@ def test_fwpkm_memory_e2e():
     assert actions_t1.shape == (2, 32, 4)
     assert len(fast_weights1) == 5
     assert fast_weights1[2].step == 2
+
+def test_fwa_memory_e2e():
+    from fast_weight_attention import FastWeightAttention
+    from mimic_video import MimicVideo
+    from robo_ttt import RoboTTT, MemoryKeyValueBind, fWAWrapper, TTTWrapper
+
+    dim = 16
+    policy = MimicVideo(
+        dim = dim,
+        dim_video_hidden = dim,
+        depth = 5,
+        dim_head = 8,
+        heads = 2,
+        dim_action = 4,
+        dim_joint_state = 4
+    )
+
+    # 4 MLPs (index 0) and 1 fwa in the middle (index 1)
+    mlp_memory = MemoryKeyValueBind(dim, nn.Sequential(nn.Linear(dim, 32), nn.GELU(), nn.Linear(32, dim)))
+    mlp_wrapper = TTTWrapper(dim, memory = mlp_memory)
+
+    fwa = FastWeightAttention(dim = dim, dim_head = 8, heads = 2, causal = True)
+    fwa_memory = fWAWrapper(fwa)
+    fwa_wrapper = TTTWrapper(dim, memory = fwa_memory, select_tokens_slice = slice(1, None))
+
+    ttt_module_paths = [
+        (0, 'layers.0.2'),
+        (0, 'layers.1.2'),
+        (1, 'layers.2.2'),
+        (0, 'layers.3.2'),
+        (0, 'layers.4.2')
+    ]
+
+    model = RoboTTT(
+        policy,
+        ttt_wrapper = (mlp_wrapper, fwa_wrapper),
+        ttt_module_paths = ttt_module_paths,
+        batch_time_arg = 'video_hiddens',
+        expand_time_args = ('prompt_token_ids',),
+        times_arg = 'time'
+    )
+
+    video_hiddens = torch.rand(2, 3, 5, dim)
+    joint_state = torch.randn(2, 3, 4)
+    actions = torch.randn(2, 3, 32, 4)
+    prompt_token_ids = torch.tensor([[10, 20, 30, -1], [15, 25, -1, -1]])
+
+    loss, fast_weights = model(
+        prompt_token_ids = prompt_token_ids,
+        video_hiddens = video_hiddens,
+        actions = actions,
+        joint_state = joint_state,
+        return_unreduced_loss = True,
+        return_fast_weights = True
+    )
+
+    assert loss.shape == (2, 3)
+    assert len(fast_weights) == 5
+
+    # 4 MLPs and 1 fwa in the middle (layer 2)
+    assert 'wq' not in fast_weights[0].fast_weights
+    assert 'wq' not in fast_weights[1].fast_weights
+    assert 'wq' in fast_weights[2].fast_weights
+    assert 'wq' not in fast_weights[3].fast_weights
+    assert 'wq' not in fast_weights[4].fast_weights
+
+    loss.sum().backward()
+
+    # sample / rollout test
+    obs_hiddens = torch.randn(2, 5, dim)
+    obs_joint = torch.randn(2, 4)
+
+    actions_t1, fast_weights1 = model.sample(
+        prompt_token_ids = prompt_token_ids,
+        video_hiddens = obs_hiddens,
+        joint_state = obs_joint,
+        steps = 2,
+        batch_size = 2,
+        auto_unsqueeze_time = True,
+        return_fast_weights = True
+    )
+
+    assert actions_t1.shape == (2, 32, 4)
+    assert len(fast_weights1) == 5
+    assert fast_weights1[2].step == 2
