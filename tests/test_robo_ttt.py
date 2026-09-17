@@ -135,7 +135,7 @@ def test_readme_full_policy_example():
     model = RoboTTT(
         policy,
         ttt_wrapper = ttt_wrapper,
-        ttt_module_paths = ('to_action_tokens',),
+        ttt_module_paths = ('to_action_tokens.0',),
         batch_time_arg = 'video_hiddens',
         expand_time_args = ('prompt_token_ids',),
         times_arg = 'time'
@@ -204,7 +204,7 @@ def test_sequence_action_forcing():
     model = RoboTTT(
         vam_model,
         ttt_wrapper = wrapper,
-        ttt_module_paths = ('to_action_tokens',),
+        ttt_module_paths = ('to_action_tokens.0',),
         batch_time_arg = 'video_hiddens',
         expand_time_args = ('prompt_token_ids',)
     )
@@ -252,7 +252,7 @@ def test_robo_ttt_loss_mask(has_loss_mask):
     model = RoboTTT(
         vam_model,
         ttt_wrapper = wrapper,
-        ttt_module_paths = ('to_action_tokens',),
+        ttt_module_paths = ('to_action_tokens.0',),
         batch_time_arg = 'video_hiddens',
         expand_time_args = ('prompt_token_ids',)
     )
@@ -396,7 +396,7 @@ def test_robo_ttt_sample():
     model = RoboTTT(
         vam_model,
         ttt_wrapper = wrapper,
-        ttt_module_paths = ('to_action_tokens',),
+        ttt_module_paths = ('to_action_tokens.0',),
         batch_time_arg = 'video_hiddens',
         expand_time_args = ('prompt_token_ids',)
     )
@@ -458,7 +458,7 @@ def test_multistep_denoising_sample():
     model = RoboTTT(
         vam_model,
         ttt_wrapper = wrapper,
-        ttt_module_paths = ('to_action_tokens',),
+        ttt_module_paths = ('to_action_tokens.0',),
         batch_time_arg = 'video_hiddens',
         expand_time_args = ('prompt_token_ids',)
     )
@@ -506,7 +506,7 @@ def test_pi_zero_robo_ttt():
     model = RoboTTT(
         base_pizero,
         ttt_wrapper = wrapper,
-        ttt_module_paths = ('layers.0',),
+        ttt_module_paths = ('layers.0.1',),
         batch_time_arg = 'visual_tokens',
         expand_time_args = ('token_ids',),
         omit_time_args = ('token_ids',),
@@ -560,7 +560,7 @@ def test_sample_auto_unsqueeze_time(auto_unsqueeze_time):
     model = RoboTTT(
         policy,
         ttt_wrapper = ttt_wrapper,
-        ttt_module_paths = ('to_action_tokens',),
+        ttt_module_paths = ('to_action_tokens.0',),
         batch_time_arg = 'video_hiddens',
         expand_time_args = ('prompt_token_ids',),
         times_arg = 'time'
@@ -641,7 +641,7 @@ def test_custom_wrapper_lstm():
     model = RoboTTT(
         policy,
         ttt_wrapper = custom_wrapper,
-        ttt_module_paths = ('to_action_tokens',),
+        ttt_module_paths = ('to_action_tokens.0',),
         batch_time_arg = 'video_hiddens',
         expand_time_args = ('prompt_token_ids',),
         times_arg = 'time'
@@ -717,7 +717,7 @@ def test_finetune_parameters():
     model = RoboTTT(
         policy,
         ttt_wrapper = ttt_wrapper,
-        ttt_module_paths = ('to_action_tokens',),
+        ttt_module_paths = ('to_action_tokens.0',),
         batch_time_arg = 'video_hiddens',
         expand_time_args = ('prompt_token_ids',),
         times_arg = 'time'
@@ -900,3 +900,83 @@ def test_fwa_memory_e2e():
     assert actions_t1.shape == (2, 32, 4)
     assert len(fast_weights1) == 5
     assert fast_weights1[2].step == 2
+
+@param('state_arg', ['video_hiddens', 'joint_state'])
+@param('slice_tokens', [False, True])
+def test_next_latent_forward_dynamics(state_arg, slice_tokens):
+    from mimic_video import MimicVideo
+    from robo_ttt import RoboTTT, MemoryKeyValueBind, TTTWrapper
+
+    dim = 32
+    dim_state = 4 if state_arg == 'joint_state' else None
+    predictor_kwargs = dict(eps = 1e-7)
+
+    if slice_tokens:
+        predictor_kwargs.update(
+            action_tokens_slice = slice(0, 16),
+            state_tokens_slice = slice(0, 2) if state_arg == 'video_hiddens' else None
+        )
+
+    memory = MemoryKeyValueBind(dim, nn.Sequential(nn.Linear(dim, 64), nn.GELU(), nn.Linear(64, dim)))
+    ttt_wrapper = TTTWrapper(dim, memory = memory)
+
+    policy = MimicVideo(
+        dim = dim,
+        dim_video_hidden = dim,
+        depth = 2,
+        dim_head = 8,
+        heads = 2,
+        dim_action = 4,
+        dim_joint_state = 4
+    )
+
+    model = RoboTTT(
+        policy,
+        ttt_wrapper = ttt_wrapper,
+        ttt_module_paths = ('to_action_tokens.0',),
+        batch_time_arg = 'video_hiddens',
+        expand_time_args = ('prompt_token_ids',),
+        times_arg = 'time',
+        predict_next_latent = True,
+        next_latent_predictor_kwargs = predictor_kwargs,
+        state_arg = state_arg,
+        dim_state = dim_state
+    )
+
+    video_hiddens = torch.rand(2, 3, 5, dim)
+    joint_state = torch.randn(2, 3, 4)
+    actions = torch.randn(2, 3, 32, 4)
+    prompt_token_ids = torch.tensor([[10, 20, 30, -1], [15, 25, -1, -1]])
+
+    loss = model(
+        prompt_token_ids = prompt_token_ids,
+        video_hiddens = video_hiddens,
+        actions = actions,
+        joint_state = joint_state
+    )
+
+    assert loss.shape == (2, 3)
+    loss.sum().backward()
+
+    # finetune parameters
+
+    assert len(list(model.finetune_parameters())) > 0
+
+    # sample
+
+    init_video_hiddens = torch.randn(2, 5, dim)
+    init_joint_state = torch.randn(2, 4)
+
+    actions_t1, fast_weights1, pred_next_latent = model.sample(
+        prompt_token_ids = prompt_token_ids,
+        video_hiddens = init_video_hiddens,
+        joint_state = init_joint_state,
+        steps = 2,
+        batch_size = 2,
+        return_fast_weights = True,
+        return_pred_next_latent = True
+    )
+
+    assert actions_t1.shape == (2, 32, 4)
+    assert len(fast_weights1) == 1
+    assert pred_next_latent.shape == (2, dim_state if exists(dim_state) else dim)

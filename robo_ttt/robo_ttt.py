@@ -4,6 +4,7 @@ from copy import deepcopy
 from functools import partial
 from collections import namedtuple
 from collections.abc import Sequence, Callable
+from itertools import chain
 
 import torch
 import torch.nn.functional as F
@@ -16,7 +17,7 @@ from einx import multiply
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange, Reduce
 
-from torch_einops_utils import pack_with_inverse, tree_map_detach, tree_map_tensor, tree_flatten_with_inverse, masked_mean
+from torch_einops_utils import pack_with_inverse, tree_map_detach, tree_map_tensor, tree_flatten_with_inverse, masked_mean, maybe_return
 from torch_einops_utils.device import module_device
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
@@ -50,6 +51,11 @@ def default(t, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def safe_div(num, den, eps = 1e-8):
+    if is_tensor(den):
+        return num / den.clamp(min = eps)
+    return num / max(den, eps)
+
 def cast_tuple(val, length = 1):
     if isinstance(val, tuple):
         return val
@@ -75,6 +81,9 @@ def has_arg(args: tuple, kwargs: dict, arg_key: ArgKey):
         return arg_key < len(args)
 
     return arg_key in kwargs
+
+def get_arg_or_none(args: tuple, kwargs: dict, arg_key: ArgKey):
+    return get_arg(args, kwargs, arg_key) if has_arg(args, kwargs, arg_key) else None
 
 def map_args(args: tuple, kwargs: dict, fn: Callable):
     # apply fn to each arg and kwarg, dispatching on key type (int positional, str keyword)
@@ -312,6 +321,7 @@ class fwPKMWrapper(Module):
     ):
         super().__init__()
         self.fw_pkm = fw_pkm
+        self.dim = getattr(fw_pkm, 'dim', None)
         self.use_delta_fast_weights = use_delta_fast_weights
 
     def forward(
@@ -355,6 +365,7 @@ class fWAWrapper(Module):
     ):
         super().__init__()
         self.fwa = fwa
+        self.dim = getattr(fwa, 'dim', None)
         self.use_delta_fast_weights = use_delta_fast_weights
 
     def forward(
@@ -407,6 +418,7 @@ class TTTWrapper(Module):
         use_delta_fast_weights = None # whether the memory module returns the change in fast weights (delta) or the full next state; defaults to the memory module's convention
     ):
         super().__init__()
+        self.dim = dim
         self.memory = memory
         self.select_tokens_slice = select_tokens_slice
         self.tbptt_step_size = tbptt_step_size
@@ -492,6 +504,98 @@ def sample_action_times(
     u = Beta(beta_a, beta_b).sample((batch_times,))
     return s * (1. - u)
 
+# next latent prediction (forward dynamics A -> S(t+1)) - Xu et al. (https://arxiv.org/abs/2609.09630)
+
+def target_rms_normalized_mse(pred: Tensor, target: Tensor, eps = 1e-6):
+    scale = target.shape[-1] ** -0.5
+    target_rms = target.norm(dim = -1, keepdim = True) * scale
+    return (safe_div(pred - target, target_rms, eps = eps) ** 2).mean()
+
+class NextLatentPredictor(Module):
+    def __init__(
+        self,
+        dim = None,
+        *,
+        dim_state = None,
+        net: Module | None = None,
+        action_tokens_slice = None,
+        state_tokens_slice = None,
+        loss_ratio = 0.1,
+        action_loss_weight = 1.0,
+        min_loss_ratio = 1e-6,
+        max_loss_ratio = 0.1,
+        eps = 1e-8
+    ):
+        super().__init__()
+
+        self.action_tokens_slice = action_tokens_slice
+        self.state_tokens_slice = state_tokens_slice
+
+        self.loss_ratio = loss_ratio
+        self.action_loss_weight = action_loss_weight
+        self.min_loss_ratio = min_loss_ratio
+        self.max_loss_ratio = max_loss_ratio
+        self.eps = eps
+
+        if exists(net):
+            self.net = net
+        else:
+            assert exists(dim), 'dim must be passed if net is not provided'
+            dim_state = default(dim_state, dim)
+            dim_in = dim + dim_state
+
+            self.net = nn.Sequential(
+                nn.RMSNorm(dim_in),
+                nn.Linear(dim_in, dim_state),
+                nn.SiLU(),
+                nn.Linear(dim_state, dim_state)
+            )
+
+    def forward(self, action_tokens, state_tokens):
+        if exists(self.action_tokens_slice):
+            action_tokens = action_tokens[..., self.action_tokens_slice, :]
+
+        if exists(self.state_tokens_slice) and state_tokens.ndim == action_tokens.ndim:
+            state_tokens = state_tokens[..., self.state_tokens_slice, :]
+
+        pooled_action_tokens = reduce(action_tokens, '... n d -> ... d', 'mean')
+
+        pooled_state_tokens = state_tokens
+        if state_tokens.ndim == action_tokens.ndim:
+            pooled_state_tokens = reduce(state_tokens, '... n d -> ... d', 'mean')
+
+        return self.net(torch.cat((pooled_action_tokens, pooled_state_tokens), dim = -1))
+
+    def loss(
+        self,
+        action_tokens,
+        curr_state,
+        next_state,
+        action_loss
+    ):
+        pred = self(action_tokens, curr_state)
+
+        target = next_state.detach()
+
+        if exists(self.state_tokens_slice) and target.ndim > pred.ndim:
+            target = target[..., self.state_tokens_slice, :]
+
+        if target.ndim > pred.ndim:
+            target = reduce(target, '... n d -> ... d', 'mean')
+
+        next_latent_loss = target_rms_normalized_mse(pred, target)
+
+        ratio = safe_div(
+            self.loss_ratio * self.action_loss_weight * action_loss.detach().mean(),
+            next_latent_loss.detach().mean(),
+            eps = self.eps
+        ).clamp(
+            min = self.min_loss_ratio,
+            max = self.max_loss_ratio
+        )
+
+        return self.action_loss_weight * action_loss + ratio * next_latent_loss
+
 # main robo-ttt class
 
 class RoboTTT(Module):
@@ -501,13 +605,19 @@ class RoboTTT(Module):
         *,
         ttt_wrapper: TTTWrapper | Module,
         ttt_module_paths: ModulePaths = (),
+        action_tokens_module_path: str | int | None = None,
         batch_time_arg = 0,
         expand_time_args: ArgKeys = (),
         omit_time_args: ArgKeys = (),
         times_arg: ArgKey | None = 'time',
         unreduced_loss_arg: ArgKey | None = 'return_unreduced_loss',
         loss_arg: ArgKey = 0,
-        sample_action_times_fn: Callable | None = None
+        sample_action_times_fn: Callable | None = None,
+        predict_next_latent: bool = False,
+        dim_state: int | None = None,
+        next_latent_predictor_kwargs: dict = dict(),
+        next_latent_predictor: NextLatentPredictor | bool | None = None,
+        state_arg: ArgKey | None = None
     ):
         super().__init__()
         self.model = model
@@ -546,6 +656,42 @@ class RoboTTT(Module):
         self.ttt_module_paths = tuple(resolved_paths)
         self.submodules = [model.get_submodule(path) for path in self.ttt_module_paths]
 
+        # action module index (which wrapper's output corresponds to action tokens)
+
+        if isinstance(action_tokens_module_path, int):
+            assert -len(self.ttt_wrappers) <= action_tokens_module_path < len(self.ttt_wrappers), f'action_tokens_module_path integer index {action_tokens_module_path} is out of range for {len(self.ttt_wrappers)} ttt wrappers'
+            self.action_module_index = action_tokens_module_path
+        elif exists(action_tokens_module_path):
+            assert action_tokens_module_path in self.ttt_module_paths, f'"{action_tokens_module_path}" not found in ttt_module_paths: {self.ttt_module_paths}'
+            self.action_module_index = self.ttt_module_paths.index(action_tokens_module_path)
+        else:
+            self.action_module_index = -1
+
+        # next latent predictor
+
+        self.next_latent_predictor = None
+
+        if isinstance(next_latent_predictor, NextLatentPredictor):
+            self.next_latent_predictor = next_latent_predictor
+        elif isinstance(next_latent_predictor, Module):
+            self.next_latent_predictor = NextLatentPredictor(net = next_latent_predictor, **next_latent_predictor_kwargs)
+        elif predict_next_latent or next_latent_predictor is True:
+            assert len(self.ttt_wrappers) > 0, 'at least one ttt wrapper is required for next latent prediction'
+
+            action_wrapper = self.ttt_wrappers[self.action_module_index]
+            layerscale = getattr(action_wrapper, 'memory_out_layerscale', None)
+            dim = default(getattr(action_wrapper, 'dim', None), layerscale.shape[0] if exists(layerscale) else None)
+
+            assert exists(dim), f'could not infer dimension from wrapper of type {action_wrapper.__class__.__name__}, please set .dim or pass in next_latent_predictor'
+
+            self.next_latent_predictor = NextLatentPredictor(
+                dim = dim,
+                dim_state = dim_state,
+                **next_latent_predictor_kwargs
+            )
+
+        self.state_arg = state_arg
+
         # default prev fast weights
 
         self.default_prev_fast_weights = (None,) * len(self.ttt_wrappers)
@@ -555,7 +701,8 @@ class RoboTTT(Module):
         return module_device(self)
 
     def finetune_parameters(self):
-        return self.ttt_wrappers.parameters()
+        predictor_params = self.next_latent_predictor.parameters() if exists(self.next_latent_predictor) else ()
+        return chain(self.ttt_wrappers.parameters(), predictor_params)
 
     def _normalize_prev_fast_weights(self, prev_fast_weights):
         prev_fast_weights = cast_tuple(default(prev_fast_weights, self.default_prev_fast_weights))
@@ -565,6 +712,8 @@ class RoboTTT(Module):
     def _forward_with_ttt(self, fn: Callable, args: tuple, kwargs: dict, time: int, prev_fast_weights):
         handles = []
         layer_fast_weights = list(prev_fast_weights)
+        all_action_chunks = [None] * len(self.ttt_wrappers)
+        hook_call_counts = [0] * len(self.ttt_wrappers)
 
         # helpers for packing and unpacking time into batch dimension
 
@@ -575,6 +724,8 @@ class RoboTTT(Module):
 
         for idx, (submodule, ttt_wrapper) in enumerate(zip(self.submodules, self.ttt_wrappers)):
             def hook(module, input, output, ttt_wrapper = ttt_wrapper, idx = idx):
+                hook_call_counts[idx] += 1
+
                 assert output.ndim == 3, f'module output must be 3d tensor of shape (batch * time, action_chunk_len, dim), but got shape {output.shape} for module "{module.__class__.__name__}"'
 
                 prev_fast_weight = layer_fast_weights[idx]
@@ -585,22 +736,31 @@ class RoboTTT(Module):
                 ttt_memory_out, next_fast_weight, _ = ttt_wrapper(action_chunks, prev_fast_weights = prev_fast_weight)
                 layer_fast_weights[idx] = next_fast_weight
 
-                # add to output
+                # policy consumes the module output modulated with the ttt memory output
 
-                return output + pack_batch_time(ttt_memory_out)
+                out = output + pack_batch_time(ttt_memory_out) if exists(ttt_memory_out) else output
+                all_action_chunks[idx] = unpack_batch_time(out)
+
+                return out
 
             handles.append(submodule.register_forward_hook(hook))
 
         # forward model
 
-        out = fn(*args, **kwargs)
+        try:
+            out = fn(*args, **kwargs)
+        finally:
+            for handle in handles:
+                handle.remove()
 
-        # unregister hooks
+        # ensure every ttt module was on the forward path, otherwise its memory was silently skipped
 
-        for handle in handles:
-            handle.remove()
+        for path, submodule, count in zip(self.ttt_module_paths, self.submodules, hook_call_counts):
+            assert count > 0, f'ttt module "{path}" ({submodule.__class__.__name__}) was never invoked during the forward pass, so its ttt memory was silently skipped - if it is a container such as a ModuleList, hook the invoked child instead'
 
-        return out, tuple(layer_fast_weights)
+        action_chunks = all_action_chunks[self.action_module_index] if len(all_action_chunks) > 0 else None
+
+        return out, tuple(layer_fast_weights), action_chunks
 
     def _get_batch_time(
         self,
@@ -670,7 +830,7 @@ class RoboTTT(Module):
 
         # forward model with ttt hooks
 
-        out, next_fast_weights = self._forward_with_ttt(fn, packed_args, packed_kwargs, time, prev_fast_weights)
+        out, next_fast_weights, action_chunks = self._forward_with_ttt(fn, packed_args, packed_kwargs, time, prev_fast_weights)
 
         # unpack time
 
@@ -678,26 +838,27 @@ class RoboTTT(Module):
 
         if auto_unsqueeze_time:
             out = tree_map_tensor(lambda t: rearrange(t, 'b 1 ... -> b ...'), out)
+            action_chunks = rearrange(action_chunks, 'b 1 ... -> b ...') if exists(action_chunks) else None
 
-        return out, next_fast_weights
+        return out, next_fast_weights, action_chunks
 
-    def sample(
+    @maybe_return('fast_weights', 'pred_next_latent', primary = 'actions')
+    def _sample(
         self,
         *args,
         sample_fn_name = None,
         prev_fast_weights = None,
-        return_fast_weights = None,
         auto_unsqueeze_time = True,
+        return_fast_weights = False,
+        return_pred_next_latent = False,
         **kwargs
     ):
-        return_fast_weights = default(return_fast_weights, exists(prev_fast_weights))
-
         # resolve sample fn
 
         sample_fn_name = default(sample_fn_name, 'sample' if hasattr(self.model, 'sample') else ('sample_actions' if hasattr(self.model, 'sample_actions') else '__call__'))
         sample_fn = getattr(self.model, sample_fn_name) if sample_fn_name != '__call__' else self.model
 
-        out, next_fast_weights = self._forward_with_time_packing(
+        out, next_fast_weights, action_chunks = self._forward_with_time_packing(
             sample_fn,
             args,
             kwargs,
@@ -705,10 +866,44 @@ class RoboTTT(Module):
             auto_unsqueeze_time = auto_unsqueeze_time
         )
 
-        if not return_fast_weights:
-            return out
+        pred_next_latent = None
 
-        return out, next_fast_weights
+        if return_pred_next_latent and exists(self.next_latent_predictor):
+            assert exists(action_chunks), 'action chunks were not captured, so the next latent prediction would be silently skipped - ensure action_tokens_module_path points to a module on the forward path'
+
+            state = get_arg_or_none(args, kwargs, self.state_arg)
+
+            assert is_tensor(state), 'state must be passed in to predict the next latent (see state_arg)'
+
+            curr_action_chunks = action_chunks[:, -1] if action_chunks.ndim == 4 else action_chunks
+
+            # when auto_unsqueeze_time is True (the default at sample time), a 3d state is (batch, tokens, dim) of the current observation
+            # otherwise the state keeps an explicit time dimension, and the last timestep is taken
+
+            state_has_time = is_tensor(state) and (state.ndim == 4 or (state.ndim == 3 and not auto_unsqueeze_time))
+
+            if state_has_time:
+                state = state[:, -1]
+
+            pred_next_latent = self.next_latent_predictor(curr_action_chunks, state)
+
+        return out, next_fast_weights, pred_next_latent
+
+    def sample(
+        self,
+        *args,
+        prev_fast_weights = None,
+        return_fast_weights = None,
+        **kwargs
+    ):
+        return_fast_weights = default(return_fast_weights, exists(prev_fast_weights))
+
+        return self._sample(
+            *args,
+            prev_fast_weights = prev_fast_weights,
+            return_fast_weights = return_fast_weights,
+            **kwargs
+        )
 
     def forward(
         self,
@@ -738,7 +933,7 @@ class RoboTTT(Module):
 
             return packed_args, packed_kwargs
 
-        out, next_fast_weights = self._forward_with_time_packing(
+        out, next_fast_weights, action_chunks = self._forward_with_time_packing(
             self.model,
             args,
             kwargs,
@@ -760,6 +955,26 @@ class RoboTTT(Module):
         if exists(loss_mask):
             assert loss_mask.ndim == 2, f'loss_mask must be 2d tensor of shape (batch, time)'
             loss = masked_mean(loss, loss_mask)
+
+        # next latent prediction (forward dynamics A -> S(t+1))
+
+        if exists(self.next_latent_predictor):
+            assert exists(action_chunks), 'action chunks were not captured, so the next latent prediction loss would be silently skipped - ensure action_tokens_module_path points to a module on the forward path'
+
+            if action_chunks.shape[1] > 1:
+                state = get_arg_or_none(args, kwargs, self.state_arg)
+
+                assert is_tensor(state), 'state must be passed in for next latent prediction (see state_arg)'
+
+                action_tokens = action_chunks[:, :-1]
+                curr_state, next_state = state[:, :-1], state[:, 1:]
+
+                loss = self.next_latent_predictor.loss(
+                    action_tokens,
+                    curr_state,
+                    next_state,
+                    action_loss = loss
+                )
 
         flat_out[self.loss_arg] = loss
         out = tree_unflatten(flat_out)

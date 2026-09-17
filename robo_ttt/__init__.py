@@ -3,5 +3,7 @@ from robo_ttt.robo_ttt import (
     TTTWrapper,
     MemoryKeyValueBind,
     fwPKMWrapper,
-    fWAWrapper
+    fWAWrapper,
+    NextLatentPredictor,
+    target_rms_normalized_mse
 )
